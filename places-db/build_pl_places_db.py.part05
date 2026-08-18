@@ -1,0 +1,73 @@
+elp="Redownload cached BDOT10k class files")
+    ap.add_argument("--out", default="poland_places.db", help="Output SQLite DB")
+    ap.add_argument("--prg", default=None, help="Optional local PRG vector dataset; otherwise official PRG WFS is used")
+    ap.add_argument("--place-simplify-m", type=float, default=5.0, help="Locality polygon simplification in meters")
+    ap.add_argument("--admin-simplify-m", type=float, default=3.0, help="PRG polygon simplification in meters")
+    ap.add_argument("--tile-km", type=int, default=40, help="Road processing tile size")
+    ap.add_argument("--dedupe-m", type=float, default=12.0, help="Merge road/boundary crossing points closer than this")
+    args = ap.parse_args()
+
+    place_source, road_source = resolve_bdot_sources(args.bdot, args.bdot_places, args.bdot_roads, args.cache_dir, args.refresh)
+    out = Path(args.out).expanduser().resolve()
+
+    started = time.time()
+    print(f"BDOT places source: {place_source}")
+    print(f"BDOT roads source : {road_source}")
+    place_layer, road_layer, cols = inspect_bdot(place_source, road_source)
+    prg_source = open_prg_source(args.prg)
+
+    # Test WFS/local PRG and fall back from WFS:URL to raw URL if GDAL requires it.
+    try:
+        _ = list_layers(prg_source)
+    except Exception:
+        if not args.prg and prg_source.startswith("WFS:"):
+            prg_source = WFS_PRG
+            _ = list_layers(prg_source)
+        else:
+            raise
+
+    con = db_create(out)
+    add_meta(con, "schema", "pl_places_v1")
+    add_meta(con, "generated_utc", datetime.now(timezone.utc).isoformat())
+    add_meta(con, "area_cell_deg", AREA_CELL_DEG)
+    add_meta(con, "entry_cell_deg", ENTRY_CELL_DEG)
+    add_meta(con, "bdot_places_file", Path(place_source).name)
+    add_meta(con, "bdot_roads_file", Path(road_source).name)
+    add_meta(con, "place_simplify_m", args.place_simplify_m)
+    add_meta(con, "admin_simplify_m", args.admin_simplify_m)
+    add_meta(con, "entry_dedupe_m", args.dedupe_m)
+
+    print("Encoding locality and administrative polygons...")
+    places, place_ids, _ = add_areas(
+        con, place_source, place_layer, cols, prg_source,
+        args.place_simplify_m, args.admin_simplify_m,
+    )
+
+    print("Computing road x locality-boundary crossing points...")
+    entries = build_entries(
+        con, road_source, road_layer, cols, places, place_ids,
+        args.tile_km * 1000, args.dedupe_m,
+    )
+    add_meta(con, "entry_count", entries)
+
+    finalize(con)
+    area_count = con.execute("SELECT count(*) FROM area").fetchone()[0]
+    place_count = con.execute("SELECT count(*) FROM area WHERE level=0").fetchone()[0]
+    cells = con.execute("SELECT count(*) FROM area_cell").fetchone()[0]
+    con.close()
+
+    size_mb = out.stat().st_size / (1024 * 1024)
+    elapsed = time.time() - started
+    print("\nDONE")
+    print(f"  DB            : {out}")
+    print(f"  size          : {size_mb:.1f} MiB")
+    print(f"  areas         : {area_count}")
+    print(f"  places        : {place_count}")
+    print(f"  area cells    : {cells}")
+    print(f"  road entries  : {entries}")
+    print(f"  elapsed       : {elapsed/60:.1f} min")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
