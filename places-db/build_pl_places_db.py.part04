@@ -1,38 +1,8 @@
-                              key = (place_id, qx, qy)
-                                    if key in seen:
-                                        continue
-                                    seen.add(key)
-
-                                    lon, lat = to_wgs84.transform(p.x, p.y)
-                                    cx = math.floor(lon / ENTRY_CELL_DEG)
-                                    cy = math.floor(lat / ENTRY_CELL_DEG)
-                                    axis = line_axis_deg(line, p)
-                                    con.execute(
-                                        """INSERT INTO entry
-                                           (id,place_id,lat_e6,lon_e6,cell_x,cell_y,road_axis_deg,road_name,road_ref,road_class,source_road_id)
-                                           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                                        (
-                                            entry_id, place_id,
-                                            int(round(lat * 1_000_000)), int(round(lon * 1_000_000)),
-                                            cx, cy, axis, rname, rref, rclass, source_id,
-                                        ),
-                                    )
-                                    entry_id += 1
-
-                if processed_tiles % 10 == 0 or processed_tiles == total_tiles:
-                    print(f"  tiles {processed_tiles}/{total_tiles}; entries={entry_id-1}")
-                tx += tile_m
-            ty += tile_m
-
-    return entry_id - 1
-
-
 def finalize(con: sqlite3.Connection) -> None:
     print("Optimizing SQLite...")
     con.execute("ANALYZE")
     con.execute("PRAGMA optimize")
     con.commit()
-    # VACUUM outside transaction
     con.execute("VACUUM")
 
 
@@ -47,7 +17,7 @@ def download_file(url: str, dest: Path, refresh: bool = False) -> Path:
         tmp.unlink()
 
     print(f"Downloading: {url}")
-    req = urllib.request.Request(url, headers={"User-Agent": "pl-places-db-builder/2.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "pl-places-db-builder/2.1"})
     try:
         with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
             total = int(r.headers.get("Content-Length") or 0)
@@ -121,4 +91,74 @@ def main() -> int:
     ap.add_argument("--bdot-places", default=None, help="Optional explicit OT_ADMS_A GPKG/GeoParquet")
     ap.add_argument("--bdot-roads", default=None, help="Optional explicit OT_SKJZ_L GPKG/GeoParquet")
     ap.add_argument("--cache-dir", default=".cache/bdot10k", help="Cache for automatically downloaded BDOT10k class files")
-    ap.add_argument("--refresh", action="store_true", h
+    ap.add_argument("--refresh", action="store_true", help="Redownload cached BDOT10k class files")
+    ap.add_argument("--out", default="poland_places.db", help="Output SQLite DB")
+    ap.add_argument("--prg", default=None, help="Optional local PRG vector dataset; otherwise official PRG WFS is used")
+    ap.add_argument("--place-simplify-m", type=float, default=5.0, help="Locality polygon simplification in meters")
+    ap.add_argument("--admin-simplify-m", type=float, default=3.0, help="PRG polygon simplification in meters")
+    ap.add_argument("--tile-km", type=int, default=40, help="Road processing tile size (used for non-Parquet road sources)")
+    ap.add_argument("--dedupe-m", type=float, default=12.0, help="Merge road/boundary crossing points closer than this")
+    args = ap.parse_args()
+
+    place_source, road_source = resolve_bdot_sources(args.bdot, args.bdot_places, args.bdot_roads, args.cache_dir, args.refresh)
+    out = Path(args.out).expanduser().resolve()
+
+    started = time.time()
+    print(f"BDOT places source: {place_source}")
+    print(f"BDOT roads source : {road_source}")
+    place_layer, road_layer, cols = inspect_bdot(place_source, road_source)
+    prg_source = open_prg_source(args.prg)
+
+    try:
+        _ = list_layers(prg_source)
+    except Exception:
+        if not args.prg and prg_source.startswith("WFS:"):
+            prg_source = WFS_PRG
+            _ = list_layers(prg_source)
+        else:
+            raise
+
+    con = db_create(out)
+    add_meta(con, "schema", "pl_places_v1")
+    add_meta(con, "generated_utc", datetime.now(timezone.utc).isoformat())
+    add_meta(con, "area_cell_deg", AREA_CELL_DEG)
+    add_meta(con, "entry_cell_deg", ENTRY_CELL_DEG)
+    add_meta(con, "bdot_places_file", Path(place_source).name)
+    add_meta(con, "bdot_roads_file", Path(road_source).name)
+    add_meta(con, "place_simplify_m", args.place_simplify_m)
+    add_meta(con, "admin_simplify_m", args.admin_simplify_m)
+    add_meta(con, "entry_dedupe_m", args.dedupe_m)
+
+    print("Encoding locality and administrative polygons...")
+    places, place_ids, _ = add_areas(
+        con, place_source, place_layer, cols, prg_source,
+        args.place_simplify_m, args.admin_simplify_m,
+    )
+
+    print("Computing road x locality-boundary crossing points...")
+    entries = build_entries(
+        con, road_source, road_layer, cols, places, place_ids,
+        args.tile_km * 1000, args.dedupe_m,
+    )
+    add_meta(con, "entry_count", entries)
+
+    finalize(con)
+    area_count = con.execute("SELECT count(*) FROM area").fetchone()[0]
+    place_count = con.execute("SELECT count(*) FROM area WHERE level=0").fetchone()[0]
+    cells = con.execute("SELECT count(*) FROM area_cell").fetchone()[0]
+    con.close()
+
+    if place_count == 0 or entries == 0:
+        raise RuntimeError(f"Invalid output database: places={place_count}, road_entries={entries}")
+
+    size_mb = out.stat().st_size / (1024 * 1024)
+    elapsed = time.time() - started
+    print("\nDONE")
+    print(f"  DB            : {out}")
+    print(f"  size          : {size_mb:.1f} MiB")
+    print(f"  areas         : {area_count}")
+    print(f"  places        : {place_count}")
+    print(f"  area cells    : {cells}")
+    print(f"  road entries  : {entries}")
+    print(f"  elapsed       : {elapsed/60:.1f} min")
+    return 0
