@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+Build a compact offline SQLite database for Android from Polish official data.
+By default it downloads only the two required BDOT10k classes (GeoParquet):
+  - BDOT10k OT_ADMS_A  : locality/place polygons
+  - BDOT10k OT_SKJZ_L  : carriageway/road geometries
+  - PRG WFS            : gmina/powiat/wojewodztwo polygons
+
+Output database contains:
+  area        - compact polygons (place/gmina/powiat/wojewodztwo)
+  area_cell   - coarse grid index for fast point-in-polygon candidate lookup
+  entry       - road x locality-boundary crossing points
+  meta        - schema/build metadata
+
+Geometry format in area.geom_zlib (little endian, zlib compressed):
+  3 bytes  : b'PG1'
+  uint32   : polygon_count
+  repeated polygon:
+    uint32 : ring_count
+    repeated ring:
+      uint32 : point_count
+      int32  : lat_e6 first point
+      int32  : lon_e6 first point
+      repeated remaining points:
+        int32: delta_lat_e6
+        int32: delta_lon_e6
+
+The database deliberately avoids SpatiaLite/JTS requirements on Android.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sqlite3
+import struct
+import sys
+import time
+import unicodedata
+import urllib.request
+import urllib.error
+import zlib
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import pyarrow.parquet as pq
+import json
+import pyogrio
+from pyproj import CRS, Transformer
+from shapely import make_valid
+from shapely.geometry import (
+    GeometryCollection,
+    LineString,
+    MultiLineString,
+    MultiPoint,
+    MultiPolygon,
+    Point,
+    Polygon,
+    box,
+)
+from shapely.strtree import STRtree
+
+EPSG_WORK = 2180
+EPSG_GPS = 4326
+WFS_PRG = "https://mapy.geoportal.gov.pl/wss/service/PZGIK/PRG/WFS/AdministrativeBoundaries"
+BDOT_GEOPARQUET_BASE = "https://opendata.geoportal.gov.pl/bdot10k/schemat2021/GeoParquet"
+BDOT_AUTO_CLASSES = ("OT_ADMS_A", "OT_SKJZ_L")
+AREA_CELL_DEG = 0.05      # ~3.5-5.5 km in Poland
+ENTRY_CELL_DEG = 0.02     # ~1.4-2.2 km in Poland
+
+
+@dataclass(frozen=True)
+class LayerInfo:
+    name: str
+    geom_type: str
+
+
+def norm(s: object) -> str:
+    s = "" if s is None else str(s)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.lower().replace("_", "").replace("-", "").replace(" ", "")
+
+
+def as_text(v: object) -> Optional[str]:
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    s = str(v).strip()
+    return s if s else None
+
+
+def parquet_geo_meta(source: str) -> tuple[str, dict]:
+    pf = pq.ParquetFile(source)
+    md = pf.schema_arrow.metadata or {}
+    raw = md.get(b"geo")
+    if not raw:
+        raise RuntimeError(f"GeoParquet metadata missing: {source}")
+    geo = json.loads(raw.decode("utf-8"))
+    primary = geo.get("primary_column")
+    if not primary:
+        raise RuntimeError(f"GeoParquet primary_column missing: {source}")
+    return primary, geo
+
+
+def list_layers(source: str) -> list[LayerInfo]:
+    # A single GeoParquet file represents one BDOT10k class/layer.
+    if str(source).lower().endswith(".parquet"):
+        primary, geo = parquet_geo_meta(source)
+        colmeta = geo.get("columns", {}).get(primary, {})
+        gtypes = colmeta.get("geometry_types") or []
+        gtype = ",".join(gtypes) if gtypes else "Geometry"
+        return [LayerInfo(Path(source).stem, gtype)]
+
+    arr = pyogrio.list_layers(source)
+    out: list[LayerInfo] = []
+    for row in arr:
+        name = str(row[0])
+        gtype = "" if len(row) < 2 or row[1] is None else str(row[1])
+        out.append(LayerInfo(name, gtype))
+    return out
+
+def find_layer(source: str, wanted: str, polygon_only: bool = False) -> str:
+    layers = list_layers(source)
+    nw = norm(wanted)
+    exact = [x for x in layers if norm(x.name) == nw]
+    if exact:
+        return exact[0].name
+
+    candidates = [x for x in layers if nw in norm(x.name)]
+    if polygon_only:
+        polys = [x for x in candidates if "polygon" in x.geom_type.lower()]
+        if polys:
+            candidates = polys
+    if not candidates:
+        print("Available layers:", file=sys.stderr)
+        for x in layers:
+            print(f"  {x.name} [{x.geom_type}]", file=sys.stderr)
+        raise RuntimeError(f"Cannot find layer matching: {wanted}")
+    candidates.sort(key=lambda x: ("gran" in norm(x.name), len(x.name)))
+    return candidates[0].name
+
+
+def pick_column(columns: Iterable[str], exact: Iterable[str] = (), contains: Iterable[str] = (), required: bool = False) -> Optional[str]:
+    cols = list(columns)
+    by_norm = {norm(c): c for c in cols}
+    for x in exact:
+        if norm(x) in by_norm:
+            return by_norm[norm(x)]
+    for token in contains:
+        nt = norm(token)
+        matches = [c for c in cols if nt in norm(c)]
+        if matches:
+            matches.sort(key=lambda c: (len(c), c))
+            return matches[0]
+    if required:
+        raise RuntimeError(f"Cannot find required column. Available: {cols}")
+    return None
+
+
+def read_layer(source: str, layer: str, columns: Optional[list[str]] = None, bbox_: Optional[tuple[float, float, float, float]] = None, max_features: Optional[int] = None) -> gpd.GeoDataFrame:
+    if str(source).lower().endswith(".parquet"):
+        geom_col, geo = parquet_geo_meta(source)
+        read_cols = None if columns is None else list(dict.fromkeys([*columns, geom_col]))
+
+        # For tiny schema/column inspection, avoid loading a national class.
+        if max_features is not None and bbox_ is None:
+            pf = pq.ParquetFile(source)
+            batches = pf.iter_batches(batch_size=max_features, columns=read_cols)
+            try:
+                batch = next(batches)
+            except StopIteration:
+                return gpd.GeoDataFrame(columns=read_cols or [], geometry=geom
