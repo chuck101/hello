@@ -1,0 +1,139 @@
+rea_id: int,
+    level: int,
+    name: str,
+    subtype: Optional[str],
+    teryt: Optional[str],
+    geom_2180,
+    simplify_m: float,
+    to_wgs84: Transformer,
+) -> tuple[int, object]:
+    geom_2180 = clean_polygonal(geom_2180)
+    if geom_2180 is None:
+        raise ValueError("empty/non-polygon geometry")
+    if simplify_m > 0:
+        simp = geom_2180.simplify(simplify_m, preserve_topology=True)
+        cleaned = clean_polygonal(simp)
+        simp = cleaned if cleaned is not None else geom_2180
+    else:
+        simp = geom_2180
+
+    # Transform to WGS84 with shapely.ops.transform-compatible wrapper.
+    from shapely.ops import transform as shp_transform
+    geom_wgs84 = shp_transform(to_wgs84.transform, simp)
+    rep = geom_2180.representative_point()
+    rep_lon, rep_lat = to_wgs84.transform(rep.x, rep.y)
+    min_lat, min_lon, max_lat, max_lon = geom_bbox_e6(geom_wgs84)
+    blob = encode_polygon_geom(geom_wgs84)
+
+    con.execute(
+        """INSERT INTO area
+           (id,level,name,subtype,teryt,rep_lat_e6,rep_lon_e6,min_lat_e6,min_lon_e6,max_lat_e6,max_lon_e6,geom_zlib)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            area_id, level, name, subtype, teryt,
+            int(round(rep_lat * 1_000_000)), int(round(rep_lon * 1_000_000)),
+            min_lat, min_lon, max_lat, max_lon, blob,
+        ),
+    )
+    con.executemany(
+        "INSERT OR IGNORE INTO area_cell(cell_x,cell_y,area_id) VALUES (?,?,?)",
+        ((cx, cy, area_id) for cx, cy in cell_range_from_bounds(geom_wgs84.bounds, AREA_CELL_DEG)),
+    )
+    return area_id, geom_2180
+
+
+def open_prg_source(local_prg: Optional[str]) -> str:
+    if local_prg:
+        return local_prg
+    # GDAL WFS driver normally accepts either raw URL or WFS:URL. Try later if needed.
+    return "WFS:" + WFS_PRG
+
+
+def find_admin_layer(source: str, token: str) -> str:
+    layers = list_layers(source)
+    nt = norm(token)
+    cands = []
+    for x in layers:
+        n = norm(x.name)
+        if nt not in n:
+            continue
+        score = 0
+        if "polygon" in x.geom_type.lower():
+            score += 10
+        if "gran" in n:       # prefer administrative-unit polygons over boundary lines
+            score -= 5
+        if n.endswith(nt) or (nt + "y") in n:
+            score += 2
+        cands.append((score, x.name, x.geom_type))
+    if not cands:
+        raise RuntimeError(f"Cannot find PRG layer for {token}. Layers: {[x.name for x in layers]}")
+    cands.sort(reverse=True)
+    return cands[0][1]
+
+
+def load_admin(source: str, token: str) -> tuple[gpd.GeoDataFrame, str, Optional[str], str]:
+    layer = find_admin_layer(source, token)
+    gdf = read_layer(source, layer)
+    gdf = ensure_crs(gdf, EPSG_WORK)
+    gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty].copy()
+    name_col = pick_column(gdf.columns, exact=["nazwa", "JPT_NAZWA_", "nazwaPelna"], contains=["nazwa"], required=True)
+    code_col = pick_column(gdf.columns, exact=["JPT_KOD_JE", "teryt", "kodTeryt", "idTERYT"], contains=["teryt", "kodje"])
+    print(f"PRG {token}: layer={layer}, objects={len(gdf)}, name={name_col}, code={code_col}")
+    return gdf, name_col, code_col, layer
+
+
+def inspect_bdot(place_source: str, road_source: str) -> tuple[str, str, dict[str, Optional[str]]]:
+    place_layer = find_layer(place_source, "OT_ADMS_A", polygon_only=True)
+    road_layer = find_layer(road_source, "OT_SKJZ_L")
+
+    ps = read_layer(place_source, place_layer, max_features=5)
+    rs = read_layer(road_source, road_layer, max_features=5)
+
+    place_cols = {
+        "name": pick_column(ps.columns, exact=["nazwa"], contains=["nazwa"], required=True),
+        "type": pick_column(ps.columns, exact=["rodzaj"], contains=["rodzaj"]),
+        "simc": pick_column(ps.columns, exact=["identyfikatorSIMC", "idTERYTMIEJSC", "SIMC"], contains=["simc", "terytmiejsc"]),
+    }
+    road_cols = {
+        "name": pick_column(rs.columns, exact=["nazwa"], contains=["nazwa"]),
+        "ref": pick_column(rs.columns, exact=["numerDrogi", "numer"], contains=["numerdrogi", "nrdrogi"]),
+        "class": pick_column(rs.columns, exact=["klasaDrogi", "kategoriaZarzadzania", "rodzaj"], contains=["klasad", "kategoria", "rodzaj"]),
+        "id": pick_column(rs.columns, exact=["lokalnyId", "x_lokalnyId"], contains=["lokalnyid"]),
+    }
+
+    print(f"BDOT place layer: {place_layer}; columns: {place_cols}")
+    print(f"BDOT road layer : {road_layer}; columns: {road_cols}")
+    return place_layer, road_layer, {**{f"place_{k}": v for k, v in place_cols.items()}, **{f"road_{k}": v for k, v in road_cols.items()}}
+
+
+def add_areas(
+    con: sqlite3.Connection,
+    place_source: str,
+    place_layer: str,
+    cols: dict[str, Optional[str]],
+    prg_source: str,
+    simplify_place_m: float,
+    simplify_admin_m: float,
+) -> tuple[gpd.GeoDataFrame, list[int], int]:
+    to_wgs84 = Transformer.from_crs(EPSG_WORK, EPSG_GPS, always_xy=True)
+    next_id = 1
+
+    # Places. Keep original projected geometries in memory for road-boundary intersections.
+    wanted_cols = [x for x in [cols["place_name"], cols["place_type"], cols["place_simc"]] if x]
+    places = read_layer(place_source, place_layer, columns=wanted_cols)
+    places = ensure_crs(places, EPSG_WORK)
+    places = places[places.geometry.notna() & ~places.geometry.is_empty].copy().reset_index(drop=True)
+    places.geometry = places.geometry.map(clean_polygonal)
+    places = places[places.geometry.notna()].reset_index(drop=True)
+
+    place_ids: list[int] = []
+    print(f"Places: {len(places)}")
+    with con:
+        for i, row in places.iterrows():
+            name = as_text(row[cols["place_name"]]) or f"place-{i}"
+            subtype = as_text(row[cols["place_type"]]) if cols["place_type"] else None
+            simc = as_text(row[cols["place_simc"]]) if cols["place_simc"] else None
+            try:
+                aid, clean_geom = insert_area(con, next_id, 0, name, subtype, simc, row.geometry, simplify_place_m, to_wgs84)
+            except Exception as e:
+    
