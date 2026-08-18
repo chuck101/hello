@@ -1,0 +1,147 @@
+            print(f"WARN: skip place {name}: {e}", file=sys.stderr)
+                place_ids.append(-1)
+                continue
+            places.at[i, "geometry"] = clean_geom
+            place_ids.append(aid)
+            next_id += 1
+            if (i + 1) % 5000 == 0:
+                print(f"  encoded places: {i+1}/{len(places)}")
+
+    # PRG administrative polygons.
+    for token, level in [("gmin", 1), ("powiat", 2), ("wojew", 3)]:
+        gdf, name_col, code_col, layer = load_admin(prg_source, token)
+        with con:
+            for _, row in gdf.iterrows():
+                name = as_text(row[name_col]) or token
+                code = as_text(row[code_col]) if code_col else None
+                try:
+                    insert_area(con, next_id, level, name, None, code, row.geometry, simplify_admin_m, to_wgs84)
+                    next_id += 1
+                except Exception as e:
+                    print(f"WARN: skip PRG {token} {name}: {e}", file=sys.stderr)
+
+    return places, place_ids, next_id
+
+
+def iter_lines(g) -> Iterator[LineString]:
+    if g is None or g.is_empty:
+        return
+    if isinstance(g, LineString):
+        yield g
+    elif isinstance(g, MultiLineString):
+        yield from g.geoms
+    elif isinstance(g, GeometryCollection):
+        for x in g.geoms:
+            if isinstance(x, LineString):
+                yield x
+            elif isinstance(x, MultiLineString):
+                yield from x.geoms
+
+
+def extract_intersection_points(g) -> Iterator[Point]:
+    if g is None or g.is_empty:
+        return
+    if isinstance(g, Point):
+        yield g
+    elif isinstance(g, MultiPoint):
+        yield from g.geoms
+    elif isinstance(g, GeometryCollection):
+        for x in g.geoms:
+            if isinstance(x, Point):
+                yield x
+            elif isinstance(x, MultiPoint):
+                yield from x.geoms
+    # Line overlap with a locality border is deliberately ignored: it is not a clean entrance.
+
+
+def line_axis_deg(line: LineString, p: Point, sample_m: float = 12.0) -> Optional[int]:
+    try:
+        d = line.project(p)
+        a = line.interpolate(max(0.0, d - sample_m))
+        b = line.interpolate(min(line.length, d + sample_m))
+        dx = b.x - a.x
+        dy = b.y - a.y
+        if dx * dx + dy * dy < 1e-6:
+            return None
+        bearing = math.degrees(math.atan2(dx, dy)) % 360.0  # north=0, clockwise
+        return int(round(bearing % 180.0)) % 180
+    except Exception:
+        return None
+
+
+def build_entries(
+    con: sqlite3.Connection,
+    road_source: str,
+    road_layer: str,
+    cols: dict[str, Optional[str]],
+    places: gpd.GeoDataFrame,
+    place_ids: list[int],
+    tile_m: int,
+    dedupe_m: float,
+) -> int:
+    road_crs = source_crs(road_source, road_layer)
+    if road_crs.to_epsg() != EPSG_WORK:
+        raise RuntimeError(
+            f"Road layer CRS is {road_crs}; tiled bbox processing currently expects EPSG:{EPSG_WORK}."
+        )
+
+    place_geoms = np.asarray(list(places.geometry), dtype=object)
+    tree = STRtree(place_geoms)
+    to_wgs84 = Transformer.from_crs(EPSG_WORK, EPSG_GPS, always_xy=True)
+
+    minx, miny, maxx, maxy = places.total_bounds
+    x0 = math.floor(minx / tile_m) * tile_m
+    y0 = math.floor(miny / tile_m) * tile_m
+    nx = math.ceil((maxx - x0) / tile_m)
+    ny = math.ceil((maxy - y0) / tile_m)
+    total_tiles = nx * ny
+
+    road_read_cols = [x for x in [cols["road_name"], cols["road_ref"], cols["road_class"], cols["road_id"]] if x]
+    seen: set[tuple[int, int, int]] = set()
+    entry_id = 1
+    processed_tiles = 0
+
+    print(f"Road crossing tiles: {nx} x {ny} = {total_tiles}; tile={tile_m/1000:.0f} km")
+
+    with con:
+        ty = y0
+        while ty < maxy:
+            tx = x0
+            while tx < maxx:
+                processed_tiles += 1
+                tile = (tx, ty, tx + tile_m, ty + tile_m)
+                try:
+                    roads = read_layer(road_source, road_layer, columns=road_read_cols, bbox_=tile)
+                except Exception as e:
+                    print(f"WARN tile {tile}: {e}", file=sys.stderr)
+                    tx += tile_m
+                    continue
+
+                if not roads.empty:
+                    roads = ensure_crs(roads, EPSG_WORK)
+                    for ridx, row in roads.iterrows():
+                        rname = as_text(row[cols["road_name"]]) if cols["road_name"] else None
+                        rref = as_text(row[cols["road_ref"]]) if cols["road_ref"] else None
+                        rclass = as_text(row[cols["road_class"]]) if cols["road_class"] else None
+                        source_id = as_text(row[cols["road_id"]]) if cols["road_id"] else str(ridx)
+
+                        for line in iter_lines(row.geometry):
+                            if line.is_empty or line.length < 0.5:
+                                continue
+                            # Restrict duplicate work: process crossing points only if point falls in this tile.
+                            candidate_idxs = tree.query(line, predicate="intersects")
+                            for pi in candidate_idxs:
+                                pi = int(pi)
+                                place_id = place_ids[pi]
+                                if place_id < 0:
+                                    continue
+                                pg = place_geoms[pi]
+                                inter = line.intersection(pg.boundary)
+                                for p in extract_intersection_points(inter):
+                                    in_x = tile[0] <= p.x < tile[2] or (tile[2] >= maxx and tile[0] <= p.x <= tile[2])
+                                    in_y = tile[1] <= p.y < tile[3] or (tile[3] >= maxy and tile[1] <= p.y <= tile[3])
+                                    if not (in_x and in_y):
+                                        continue
+                                    qx = int(round(p.x / dedupe_m))
+                                    qy = int(round(p.y / dedupe_m))
+      
