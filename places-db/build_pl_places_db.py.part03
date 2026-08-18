@@ -1,21 +1,25 @@
-            print(f"WARN: skip place {name}: {e}", file=sys.stderr)
+                print(f"WARN: skip place {name}: {e}", file=sys.stderr)
                 place_ids.append(-1)
                 continue
-            places.at[i, "geometry"] = clean_geom
+            places.at[i, place_geom_col] = clean_geom
             place_ids.append(aid)
             next_id += 1
             if (i + 1) % 5000 == 0:
                 print(f"  encoded places: {i+1}/{len(places)}")
 
+    if not place_ids or sum(1 for x in place_ids if x > 0) == 0:
+        raise RuntimeError("No locality polygons were encoded from OT_ADMS_A")
+
     # PRG administrative polygons.
     for token, level in [("gmin", 1), ("powiat", 2), ("wojew", 3)]:
         gdf, name_col, code_col, layer = load_admin(prg_source, token)
+        geom_col = gdf.geometry.name
         with con:
             for _, row in gdf.iterrows():
                 name = as_text(row[name_col]) or token
                 code = as_text(row[code_col]) if code_col else None
                 try:
-                    insert_area(con, next_id, level, name, None, code, row.geometry, simplify_admin_m, to_wgs84)
+                    insert_area(con, next_id, level, name, None, code, row[geom_col], simplify_admin_m, to_wgs84)
                     next_id += 1
                 except Exception as e:
                     print(f"WARN: skip PRG {token} {name}: {e}", file=sys.stderr)
@@ -51,7 +55,6 @@ def extract_intersection_points(g) -> Iterator[Point]:
                 yield x
             elif isinstance(x, MultiPoint):
                 yield from x.geoms
-    # Line overlap with a locality border is deliberately ignored: it is not a clean entrance.
 
 
 def line_axis_deg(line: LineString, p: Point, sample_m: float = 12.0) -> Optional[int]:
@@ -63,10 +66,77 @@ def line_axis_deg(line: LineString, p: Point, sample_m: float = 12.0) -> Optiona
         dy = b.y - a.y
         if dx * dx + dy * dy < 1e-6:
             return None
-        bearing = math.degrees(math.atan2(dx, dy)) % 360.0  # north=0, clockwise
+        bearing = math.degrees(math.atan2(dx, dy)) % 360.0
         return int(round(bearing % 180.0)) % 180
     except Exception:
         return None
+
+
+def iter_parquet_geodata_batches(source: str, columns: list[str], batch_size: int = 50000) -> Iterator[gpd.GeoDataFrame]:
+    """Stream GeoParquet without relying on bbox metadata."""
+    geom_col, geo = parquet_geo_meta(source)
+    read_cols = list(dict.fromkeys([*columns, geom_col]))
+    crs = geo.get("columns", {}).get(geom_col, {}).get("crs")
+    pf = pq.ParquetFile(source)
+    for batch in pf.iter_batches(batch_size=batch_size, columns=read_cols):
+        df = batch.to_pandas()
+        if df.empty:
+            continue
+        df[geom_col] = gpd.GeoSeries.from_wkb(df[geom_col], crs=crs)
+        yield gpd.GeoDataFrame(df, geometry=geom_col, crs=crs)
+
+
+def process_road_frame(
+    con: sqlite3.Connection,
+    roads: gpd.GeoDataFrame,
+    cols: dict[str, Optional[str]],
+    place_geoms,
+    place_ids: list[int],
+    tree: STRtree,
+    to_wgs84: Transformer,
+    seen: set[tuple[int, int, int]],
+    entry_id: int,
+    dedupe_m: float,
+) -> int:
+    if roads.empty:
+        return entry_id
+    roads = ensure_crs(roads, EPSG_WORK)
+    geom_col = roads.geometry.name
+    for ridx, row in roads.iterrows():
+        rname = as_text(row[cols["road_name"]]) if cols["road_name"] else None
+        rref = as_text(row[cols["road_ref"]]) if cols["road_ref"] else None
+        rclass = as_text(row[cols["road_class"]]) if cols["road_class"] else None
+        source_id = as_text(row[cols["road_id"]]) if cols["road_id"] else str(ridx)
+        for line in iter_lines(row[geom_col]):
+            if line.is_empty or line.length < 0.5:
+                continue
+            candidate_idxs = tree.query(line, predicate="intersects")
+            for pi in candidate_idxs:
+                pi = int(pi)
+                place_id = place_ids[pi]
+                if place_id < 0:
+                    continue
+                inter = line.intersection(place_geoms[pi].boundary)
+                for p in extract_intersection_points(inter):
+                    qx = int(round(p.x / dedupe_m))
+                    qy = int(round(p.y / dedupe_m))
+                    key = (place_id, qx, qy)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    lon, lat = to_wgs84.transform(p.x, p.y)
+                    cx = math.floor(lon / ENTRY_CELL_DEG)
+                    cy = math.floor(lat / ENTRY_CELL_DEG)
+                    axis = line_axis_deg(line, p)
+                    con.execute(
+                        """INSERT INTO entry
+                           (id,place_id,lat_e6,lon_e6,cell_x,cell_y,road_axis_deg,road_name,road_ref,road_class,source_road_id)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                        (entry_id, place_id, int(round(lat * 1_000_000)), int(round(lon * 1_000_000)),
+                         cx, cy, axis, rname, rref, rclass, source_id),
+                    )
+                    entry_id += 1
+    return entry_id
 
 
 def build_entries(
@@ -80,68 +150,44 @@ def build_entries(
     dedupe_m: float,
 ) -> int:
     road_crs = source_crs(road_source, road_layer)
-    if road_crs.to_epsg() != EPSG_WORK:
-        raise RuntimeError(
-            f"Road layer CRS is {road_crs}; tiled bbox processing currently expects EPSG:{EPSG_WORK}."
-        )
-
     place_geoms = np.asarray(list(places.geometry), dtype=object)
     tree = STRtree(place_geoms)
     to_wgs84 = Transformer.from_crs(EPSG_WORK, EPSG_GPS, always_xy=True)
-
-    minx, miny, maxx, maxy = places.total_bounds
-    x0 = math.floor(minx / tile_m) * tile_m
-    y0 = math.floor(miny / tile_m) * tile_m
-    nx = math.ceil((maxx - x0) / tile_m)
-    ny = math.ceil((maxy - y0) / tile_m)
-    total_tiles = nx * ny
-
     road_read_cols = [x for x in [cols["road_name"], cols["road_ref"], cols["road_class"], cols["road_id"]] if x]
     seen: set[tuple[int, int, int]] = set()
     entry_id = 1
-    processed_tiles = 0
-
-    print(f"Road crossing tiles: {nx} x {ny} = {total_tiles}; tile={tile_m/1000:.0f} km")
 
     with con:
-        ty = y0
-        while ty < maxy:
-            tx = x0
-            while tx < maxx:
-                processed_tiles += 1
-                tile = (tx, ty, tx + tile_m, ty + tile_m)
-                try:
+        if str(road_source).lower().endswith(".parquet"):
+            print("Road crossings: streaming GeoParquet in 50k-row batches (no bbox required)")
+            for batch_no, roads in enumerate(iter_parquet_geodata_batches(road_source, road_read_cols, 50000), start=1):
+                entry_id = process_road_frame(con, roads, cols, place_geoms, place_ids, tree, to_wgs84, seen, entry_id, dedupe_m)
+                if batch_no % 5 == 0:
+                    print(f"  road batches {batch_no}; entries={entry_id-1}")
+        else:
+            if road_crs.to_epsg() != EPSG_WORK:
+                raise RuntimeError(f"Road layer CRS is {road_crs}; tiled processing expects EPSG:{EPSG_WORK}.")
+            minx, miny, maxx, maxy = places.total_bounds
+            x0 = math.floor(minx / tile_m) * tile_m
+            y0 = math.floor(miny / tile_m) * tile_m
+            nx = math.ceil((maxx - x0) / tile_m)
+            ny = math.ceil((maxy - y0) / tile_m)
+            total_tiles = nx * ny
+            processed_tiles = 0
+            print(f"Road crossing tiles: {nx} x {ny} = {total_tiles}; tile={tile_m/1000:.0f} km")
+            ty = y0
+            while ty < maxy:
+                tx = x0
+                while tx < maxx:
+                    processed_tiles += 1
+                    tile = (tx, ty, tx + tile_m, ty + tile_m)
                     roads = read_layer(road_source, road_layer, columns=road_read_cols, bbox_=tile)
-                except Exception as e:
-                    print(f"WARN tile {tile}: {e}", file=sys.stderr)
+                    entry_id = process_road_frame(con, roads, cols, place_geoms, place_ids, tree, to_wgs84, seen, entry_id, dedupe_m)
+                    if processed_tiles % 10 == 0 or processed_tiles == total_tiles:
+                        print(f"  tiles {processed_tiles}/{total_tiles}; entries={entry_id-1}")
                     tx += tile_m
-                    continue
+                ty += tile_m
 
-                if not roads.empty:
-                    roads = ensure_crs(roads, EPSG_WORK)
-                    for ridx, row in roads.iterrows():
-                        rname = as_text(row[cols["road_name"]]) if cols["road_name"] else None
-                        rref = as_text(row[cols["road_ref"]]) if cols["road_ref"] else None
-                        rclass = as_text(row[cols["road_class"]]) if cols["road_class"] else None
-                        source_id = as_text(row[cols["road_id"]]) if cols["road_id"] else str(ridx)
-
-                        for line in iter_lines(row.geometry):
-                            if line.is_empty or line.length < 0.5:
-                                continue
-                            # Restrict duplicate work: process crossing points only if point falls in this tile.
-                            candidate_idxs = tree.query(line, predicate="intersects")
-                            for pi in candidate_idxs:
-                                pi = int(pi)
-                                place_id = place_ids[pi]
-                                if place_id < 0:
-                                    continue
-                                pg = place_geoms[pi]
-                                inter = line.intersection(pg.boundary)
-                                for p in extract_intersection_points(inter):
-                                    in_x = tile[0] <= p.x < tile[2] or (tile[2] >= maxx and tile[0] <= p.x <= tile[2])
-                                    in_y = tile[1] <= p.y < tile[3] or (tile[3] >= maxy and tile[1] <= p.y <= tile[3])
-                                    if not (in_x and in_y):
-                                        continue
-                                    qx = int(round(p.x / dedupe_m))
-                                    qy = int(round(p.y / dedupe_m))
-      
+    if entry_id == 1:
+        raise RuntimeError("No road/locality boundary crossings were produced")
+    return entry_id - 1
