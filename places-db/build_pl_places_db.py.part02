@@ -125,6 +125,7 @@ def add_areas(
     places = places[places.geometry.notna() & ~places.geometry.is_empty].copy().reset_index(drop=True)
     places.geometry = places.geometry.map(clean_polygonal)
     places = places[places.geometry.notna()].reset_index(drop=True)
+    place_geom_col = places.geometry.name
 
     place_ids: list[int] = []
     print(f"Places: {len(places)}")
@@ -134,6 +135,5 @@ def add_areas(
             subtype = as_text(row[cols["place_type"]]) if cols["place_type"] else None
             simc = as_text(row[cols["place_simc"]]) if cols["place_simc"] else None
             try:
-                aid, clean_geom = insert_area(con, next_id, 0, name, subtype, simc, row.geometry, simplify_place_m, to_wgs84)
+                aid, clean_geom = insert_area(con, next_id, 0, name, subtype, simc, row[place_geom_col], simplify_place_m, to_wgs84)
             except Exception as e:
-    
