@@ -24,14 +24,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Bundle OCR and version app
+      - name: Bundle OCR, test labels and version app
         shell: bash
         run: |
           set -euxo pipefail
           VERSION="$(date -u +'%Y.%m.%d.%H%M')-${GITHUB_SHA::7}"
           HIDDEN_PATH="r/6b9c4f2a8e17d3c5f9410a7e2d8b64c1"
 
-          mkdir -p czk-pln/ocr/core czk-pln/ocr/lang
+          mkdir -p czk-pln/ocr/core czk-pln/ocr/lang czk-pln/test-labels /tmp/label-src
           curl -fL https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js -o czk-pln/ocr/tesseract.min.js
           curl -fL https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/worker.min.js -o czk-pln/ocr/worker.min.js
           for f in \
@@ -42,6 +42,47 @@ jobs:
             curl -fL "https://cdn.jsdelivr.net/npm/tesseract.js-core@6.0.0/$f" -o "czk-pln/ocr/core/$f"
           done
           curl -fL https://tessdata.projectnaptha.com/4.0.0_fast/eng.traineddata.gz -o czk-pln/ocr/lang/eng.traineddata.gz
+
+          # Real Czech labels / flyers used by the in-app OCR test.
+          curl -fL -A 'Mozilla/5.0' 'https://1884403144.rsc.cdn77.org/foto/cukr-obchod-supermarket-drahota-zdrazeni/Zml0LWluLzk3OHg5OTk5L2ZpbHRlcnM6cXVhbGl0eSg4NSk6bm9fdXBzY2FsZSgpL2ltZw/8009205.jpg?e=0&st=rMPIIpzmzBIc9dopSfYZr0XbN48aJVbKnbYSAenGaOQ&ts=1600812000&v=0' -o /tmp/label-src/tescoStore.jpg
+          curl -fL -A 'Mozilla/5.0' 'https://d15-a.sdn.cz/d_15/c_img_oc_A/kcukOQcMmCfTdKCWrEDISWN/acd1/slevy.jpeg' -o /tmp/label-src/coke.jpg
+          curl -fL -A 'Mozilla/5.0' 'https://cz2.staticac.cz/foto/letaky/183051/l18305101.jpg' -o /tmp/label-src/pennyJan.jpg
+          curl -fL -A 'Mozilla/5.0' 'https://assets-eu-01.kc-usercontent.com/b490fe50-3436-01c5-6cd3-1e0fc2fff5ea/469bdbd5-6706-440b-8e7d-b3c3a5558ce3/31KW_ONE_29_07_2026_148mm_WEB_leaflet_page-0001.jpg?fm=webp&lossless=0&q=80&w=875' -o /tmp/label-src/pennyJul.webp
+          curl -fL -A 'Mozilla/5.0' 'https://img.kupi.cz/letaky/347919/thumbs/penny-market-letak-2_1500.jpg' -o /tmp/label-src/pennyApr.jpg
+          curl -fL -A 'Mozilla/5.0' 'https://archiv.kompasslev.cz/kompasslev.cz/public/gimg/4/9/8/9/1/7/0/4989170-1080-1080.jpg' -o /tmp/label-src/tescoFlyer.jpg
+          curl -fL -A 'Mozilla/5.0' 'https://img.najdislevu.cz/letaky/lidl/letak47598/strana1.jpg' -o /tmp/label-src/lidl.jpg
+
+          python3 -m pip install --quiet pillow
+          python3 <<'PY'
+          from PIL import Image, ImageOps
+          from pathlib import Path
+          import json
+          tests=[
+            ('Tesco Clubcard 29,90','tescoStore.jpg',29.90,(.36,.17,.38,.28)),
+            ('Coca-Cola 49,90','coke.jpg',49.90,(.27,.54,.48,.38)),
+            ('Penny tvaroh 9,90','pennyJan.jpg',9.90,(.55,.00,.40,.35)),
+            ('Penny hrozny 37,90','pennyJan.jpg',37.90,(.03,.34,.29,.26)),
+            ('Penny mleko 14,90','pennyJan.jpg',14.90,(.70,.30,.27,.30)),
+            ('Penny papier 29,90','pennyJul.webp',29.90,(.56,.01,.41,.42)),
+            ('Penny rajcata 49,90','pennyApr.jpg',49.90,(.14,.00,.24,.22)),
+            ('Penny hrozny 69,90','pennyApr.jpg',69.90,(.49,.00,.25,.22)),
+            ('Tesco Hermelin 29,90','tescoFlyer.jpg',29.90,(.58,.00,.28,.28)),
+            ('Tesco okurka 11,90','tescoFlyer.jpg',11.90,(.57,.23,.26,.28)),
+            ('Lidl Rama 39,90','lidl.jpg',39.90,(.00,.00,.36,.35)),
+            ('Lidl Radegast 19,90','lidl.jpg',19.90,(.00,.36,.35,.38)),
+          ]
+          src=Path('/tmp/label-src'); out=Path('czk-pln/test-labels'); labels=[]
+          for i,(name,file,expected,r) in enumerate(tests,1):
+              im=Image.open(src/file).convert('RGB')
+              W,H=im.size; x,y,w,h=r
+              box=(max(0,int(W*x)),max(0,int(H*y)),min(W,int(W*(x+w))),min(H,int(H*(y+h))))
+              crop=im.crop(box)
+              crop=ImageOps.contain(crop,(1000,700))
+              fn=f'label-{i:02d}.jpg'
+              crop.save(out/fn,'JPEG',quality=88,optimize=True)
+              labels.append({'name':name,'expected':expected,'file':'./test-labels/'+fn})
+          (out/'manifest.json').write_text(json.dumps({'labels':labels},ensure_ascii=False,indent=2))
+          PY
 
           sed -i 's#https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js#./ocr/tesseract.min.js#g' czk-pln/index.html
           python3 - "$VERSION" <<'PY'
@@ -61,40 +102,39 @@ jobs:
               f'<script>window.APP_VERSION={version!r};</script>\n'
           )
           s=s.replace(marker,inject+marker,1)
-          s=s.replace('</body>','<script src="./update.js"></script>\n</body>',1)
+          s=s.replace('</body>','<script src="./test-mode.js"></script>\n<script src="./update.js"></script>\n</body>',1)
           p.write_text(s)
           PY
 
           printf '{"version":"%s"}\n' "$VERSION" > czk-pln/version.json
 
-          cat > czk-pln/sw.js <<EOF
-          const CACHE='czk-pln-${VERSION}';
-          const PRECACHE=[
-            './','./index.html','./manifest.json','./icon.svg','./update.js','./version.json',
-            './ocr/tesseract.min.js','./ocr/worker.min.js','./ocr/lang/eng.traineddata.gz',
-            './ocr/core/tesseract-core.wasm.js','./ocr/core/tesseract-core.wasm',
-            './ocr/core/tesseract-core-simd.wasm.js','./ocr/core/tesseract-core-simd.wasm',
-            './ocr/core/tesseract-core-lstm.wasm.js','./ocr/core/tesseract-core-lstm.wasm',
-            './ocr/core/tesseract-core-simd-lstm.wasm.js','./ocr/core/tesseract-core-simd-lstm.wasm'
-          ];
-          self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(PRECACHE)));self.skipWaiting();});
-          self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))));self.clients.claim();});
-          self.addEventListener('message',e=>{if(e.data&&e.data.type==='SKIP_WAITING')self.skipWaiting();});
-          self.addEventListener('fetch',e=>{
+          python3 - "$VERSION" <<'PY'
+          from pathlib import Path
+          import json,sys
+          version=sys.argv[1]
+          files=['./','./index.html','./manifest.json','./icon.svg','./update.js','./test-mode.js','./version.json',
+                 './ocr/tesseract.min.js','./ocr/worker.min.js','./ocr/lang/eng.traineddata.gz',
+                 './ocr/core/tesseract-core.wasm.js','./ocr/core/tesseract-core.wasm',
+                 './ocr/core/tesseract-core-simd.wasm.js','./ocr/core/tesseract-core-simd.wasm',
+                 './ocr/core/tesseract-core-lstm.wasm.js','./ocr/core/tesseract-core-lstm.wasm',
+                 './ocr/core/tesseract-core-simd-lstm.wasm.js','./ocr/core/tesseract-core-simd-lstm.wasm',
+                 './test-labels/manifest.json']
+          files += [f'./test-labels/label-{i:02d}.jpg' for i in range(1,13)]
+          sw=f"""const CACHE='czk-pln-{version}';
+          const PRECACHE={json.dumps(files)};
+          self.addEventListener('install',e=>{{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(PRECACHE)));self.skipWaiting();}});
+          self.addEventListener('activate',e=>{{e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))));self.clients.claim();}});
+          self.addEventListener('message',e=>{{if(e.data&&e.data.type==='SKIP_WAITING')self.skipWaiting();}});
+          self.addEventListener('fetch',e=>{{
             if(e.request.method!=='GET')return;
-            const url=new URL(e.request.url);
-            const same=url.origin===self.location.origin;
-            if(same && (e.request.mode==='navigate' || url.pathname.endsWith('/index.html'))){
-              e.respondWith(fetch(e.request,{cache:'no-store'}).then(r=>{const copy=r.clone();caches.open(CACHE).then(c=>c.put('./index.html',copy)).catch(()=>{});return r;}).catch(()=>caches.match('./index.html')));
-              return;
-            }
-            if(same && (url.pathname.endsWith('/version.json') || url.pathname.endsWith('/sw.js') || url.pathname.endsWith('/update.js'))){
-              e.respondWith(fetch(e.request,{cache:'no-store'}).then(r=>{const copy=r.clone();caches.open(CACHE).then(c=>c.put(e.request,copy)).catch(()=>{});return r;}).catch(()=>caches.match(e.request)));
-              return;
-            }
-            e.respondWith(caches.match(e.request).then(cached=>cached||fetch(e.request).then(r=>{if(r&&(r.ok||r.type==='opaque'))caches.open(CACHE).then(c=>c.put(e.request,r.clone())).catch(()=>{});return r;}).catch(()=>cached)));
-          });
-          EOF
+            const url=new URL(e.request.url);const same=url.origin===self.location.origin;
+            if(same&&(e.request.mode==='navigate'||url.pathname.endsWith('/index.html'))){{e.respondWith(fetch(e.request,{{cache:'no-store'}}).then(r=>{{const copy=r.clone();caches.open(CACHE).then(c=>c.put('./index.html',copy)).catch(()=>{{}});return r;}}).catch(()=>caches.match('./index.html')));return;}}
+            if(same&&(url.pathname.endsWith('/version.json')||url.pathname.endsWith('/sw.js')||url.pathname.endsWith('/update.js')||url.pathname.endsWith('/test-mode.js'))){{e.respondWith(fetch(e.request,{{cache:'no-store'}}).then(r=>{{const copy=r.clone();caches.open(CACHE).then(c=>c.put(e.request,copy)).catch(()=>{{}});return r;}}).catch(()=>caches.match(e.request)));return;}}
+            e.respondWith(caches.match(e.request).then(cached=>cached||fetch(e.request).then(r=>{{if(r&&(r.ok||r.type==='opaque'))caches.open(CACHE).then(c=>c.put(e.request,r.clone())).catch(()=>{{}});return r;}}).catch(()=>cached)));
+          }});
+          """
+          Path('czk-pln/sw.js').write_text(sw)
+          PY
 
           rm -rf site
           mkdir -p "site/$HIDDEN_PATH"
