@@ -2,27 +2,19 @@
   'use strict';
 
   const installedVersion = window.APP_VERSION || 'nieznana';
+  const versionEl = document.getElementById('appVersion');
+  const statusEl = document.getElementById('updateStatus');
+  const updateBtn = document.getElementById('updateBtn');
+  if (!versionEl || !statusEl || !updateBtn) return;
+
   let reloading = false;
   let checking = false;
+  versionEl.textContent = `Wersja: ${installedVersion}`;
 
-  const bar = document.createElement('div');
-  bar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;background:#090a0d;border-top:1px solid #23262d;color:#aeb4bd;font-size:12px';
-
-  const version = document.createElement('span');
-  version.textContent = `Wersja: ${installedVersion}`;
-
-  const update = document.createElement('button');
-  update.type = 'button';
-  update.textContent = 'Aktualizuj';
-  update.style.cssText = 'min-height:36px;padding:5px 12px;border-radius:10px;font-size:12px';
-
-  bar.append(version, update);
-  const footer = document.querySelector('.buttons');
-  if (footer) footer.before(bar); else document.body.append(bar);
-
-  function setState(text, disabled=false) {
-    update.textContent = text;
-    update.disabled = disabled;
+  function setState(text, disabled=false, statusText=null) {
+    updateBtn.textContent = text;
+    updateBtn.disabled = disabled;
+    if (statusText !== null) statusEl.textContent = statusText;
   }
 
   async function fetchLatestVersion() {
@@ -43,45 +35,33 @@
     }
   }
 
-  async function activateUpdate(latestVersion, manual) {
+  async function activateUpdate(latestVersion) {
     if (!('serviceWorker' in navigator)) {
-      if (manual) alert('Ta przeglądarka nie obsługuje service workera.');
+      setState('Aktualizuj', false, 'Brak obsługi service workera');
       return;
     }
-
-    setState('Pobieram…', true);
+    setState('Pobieram…', true, `Dostępna wersja ${latestVersion}`);
     const registration = await navigator.serviceWorker.getRegistration('./') ||
       await navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' });
-
     await registration.update();
-
-    if (registration.waiting) {
-      registration.waiting.postMessage({ type: 'SKIP_WAITING' });
-    }
-
-    // Nowy service worker ma skipWaiting(), więc controllerchange nastąpi po instalacji.
-    // Jeżeli przeglądarka z jakiegoś powodu nie przełączy kontrolera od razu,
-    // pozostawiamy użytkownikowi czytelny status zamiast zapętlać przeładowania.
-    setState(`Nowa ${latestVersion}`, true);
+    if (registration.waiting) registration.waiting.postMessage({ type: 'SKIP_WAITING' });
+    setState('Instaluję…', true, `Aktualizacja do ${latestVersion}`);
   }
 
   async function checkForUpdate(manual=false) {
     if (checking) return;
     checking = true;
-    if (manual) setState('Sprawdzam…', true);
-
+    if (manual) setState('Sprawdzam…', true, 'Łączenie z serwerem…');
     try {
       const latest = await fetchLatestVersion();
       if (latest === installedVersion) {
-        setState(manual ? 'Aktualna ✓' : 'Aktualizuj', false);
-        if (manual) setTimeout(() => setState('Aktualizuj', false), 1800);
+        setState('Aktualizuj', false, 'Masz najnowszą wersję');
         return;
       }
-      await activateUpdate(latest, manual);
+      await activateUpdate(latest);
     } catch (error) {
       console.warn('Sprawdzanie aktualizacji:', error);
-      setState(manual ? 'Brak internetu' : 'Aktualizuj', false);
-      if (manual) setTimeout(() => setState('Aktualizuj', false), 2200);
+      setState('Aktualizuj', false, 'Brak internetu lub serwer niedostępny');
     } finally {
       checking = false;
     }
@@ -95,9 +75,6 @@
     });
   }
 
-  update.addEventListener('click', () => checkForUpdate(true));
-
-  // Automatycznie sprawdź realne połączenie z serwerem po uruchomieniu aplikacji.
-  // Brak internetu nie wpływa na pracę offline.
+  updateBtn.addEventListener('click', () => checkForUpdate(true));
   setTimeout(() => checkForUpdate(false), 1200);
 })();
