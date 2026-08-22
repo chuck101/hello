@@ -29,6 +29,8 @@ jobs:
         run: |
           set -euxo pipefail
           VERSION="$(date -u +'%Y.%m.%d.%H%M')-${GITHUB_SHA::7}"
+          HIDDEN_PATH="r/6b9c4f2a8e17d3c5f9410a7e2d8b64c1"
+
           mkdir -p czk-pln/ocr/core czk-pln/ocr/lang
           curl -fL https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js -o czk-pln/ocr/tesseract.min.js
           curl -fL https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/worker.min.js -o czk-pln/ocr/worker.min.js
@@ -54,7 +56,10 @@ jobs:
               raise SystemExit('createWorker pattern not found')
           s=s.replace(old,new)
           marker='</head>'
-          inject=f"<script>window.APP_VERSION={version!r};</script>\n"
+          inject=(
+              '<meta name="robots" content="noindex,nofollow,noarchive,nosnippet">\n'
+              f'<script>window.APP_VERSION={version!r};</script>\n'
+          )
           s=s.replace(marker,inject+marker,1)
           s=s.replace('</body>','<script src="./update.js"></script>\n</body>',1)
           p.write_text(s)
@@ -91,13 +96,21 @@ jobs:
           });
           EOF
 
+          rm -rf site
+          mkdir -p "site/$HIDDEN_PATH"
+          cp -a czk-pln/. "site/$HIDDEN_PATH/"
+          printf 'User-agent: *\nDisallow: /\n' > site/robots.txt
+          cat > site/404.html <<'EOF'
+          <!doctype html><meta charset="utf-8"><meta name="robots" content="noindex,nofollow"><title>404</title><h1>404</h1>
+          EOF
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
-      - name: Upload scanner
+      - name: Upload hidden scanner
         uses: actions/upload-pages-artifact@v4
         with:
-          path: './czk-pln'
+          path: './site'
 
       - name: Deploy to GitHub Pages
         id: deployment
