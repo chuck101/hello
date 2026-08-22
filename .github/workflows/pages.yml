@@ -24,17 +24,48 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Bundle OCR files locally
+      - name: Bundle OCR locally
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p czk-pln/ocr/core czk-pln/ocr/lang
           curl -fL https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js -o czk-pln/ocr/tesseract.min.js
           curl -fL https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/worker.min.js -o czk-pln/ocr/worker.min.js
-          for f in tesseract-core.wasm.js tesseract-core-simd.wasm.js tesseract-core-lstm.wasm.js tesseract-core-simd-lstm.wasm.js; do
+          for f in \
+            tesseract-core.wasm.js tesseract-core.wasm \
+            tesseract-core-simd.wasm.js tesseract-core-simd.wasm \
+            tesseract-core-lstm.wasm.js tesseract-core-lstm.wasm \
+            tesseract-core-simd-lstm.wasm.js tesseract-core-simd-lstm.wasm; do
             curl -fL "https://cdn.jsdelivr.net/npm/tesseract.js-core@6.0.0/$f" -o "czk-pln/ocr/core/$f"
           done
           curl -fL https://tessdata.projectnaptha.com/4.0.0_fast/eng.traineddata.gz -o czk-pln/ocr/lang/eng.traineddata.gz
+
+          sed -i 's#https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js#./ocr/tesseract.min.js#g' czk-pln/index.html
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('czk-pln/index.html')
+          s=p.read_text()
+          old="Tesseract.createWorker('eng',1,{logger:"
+          new="Tesseract.createWorker('eng',1,{workerPath:'./ocr/worker.min.js',langPath:'./ocr/lang',corePath:'./ocr/core',logger:"
+          if old not in s:
+              raise SystemExit('createWorker pattern not found')
+          p.write_text(s.replace(old,new))
+          PY
+
+          cat > czk-pln/sw.js <<'EOF'
+          const CACHE='czk-pln-v5-full-offline';
+          const PRECACHE=[
+            './','./index.html','./manifest.json','./icon.svg',
+            './ocr/tesseract.min.js','./ocr/worker.min.js','./ocr/lang/eng.traineddata.gz',
+            './ocr/core/tesseract-core.wasm.js','./ocr/core/tesseract-core.wasm',
+            './ocr/core/tesseract-core-simd.wasm.js','./ocr/core/tesseract-core-simd.wasm',
+            './ocr/core/tesseract-core-lstm.wasm.js','./ocr/core/tesseract-core-lstm.wasm',
+            './ocr/core/tesseract-core-simd-lstm.wasm.js','./ocr/core/tesseract-core-simd-lstm.wasm'
+          ];
+          self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(PRECACHE)));self.skipWaiting();});
+          self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))));self.clients.claim();});
+          self.addEventListener('fetch',e=>{if(e.request.method!=='GET')return;e.respondWith(caches.match(e.request).then(cached=>cached||fetch(e.request).then(r=>{if(r&&(r.ok||r.type==='opaque'))caches.open(CACHE).then(c=>c.put(e.request,r.clone())).catch(()=>{});return r;}).catch(()=>cached)));});
+          EOF
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
