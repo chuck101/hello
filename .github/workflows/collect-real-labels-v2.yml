@@ -1,3 +1,4 @@
+# trigger: collector workflow already exists on default branch
 name: Collect 20 real Czech price labels v2
 
 on:
@@ -139,8 +140,6 @@ jobs:
               return rows
 
           def parse_expected(info):
-              # Wikimedia often classifies price-tag photos in categories such as
-              # "49.90 (price tag)". This is much stronger ground truth than OCR.
               for c in [info['parent_category']]+info['categories']:
                   m=re.search(r'Category:(\d{1,4})[\.,](\d{2})\s*\(price tag\)',c,re.I)
                   if m:
@@ -169,7 +168,6 @@ jobs:
                       y0=max(0,min(H-ch,int(cy-ch*.50)))
                       crop=im.crop((x0,y0,x0+cw,y0+ch))
                   else:
-                      # Still keep the REAL photograph if Tesseract cannot find a number.
                       target=2.5
                       if W/H>target:
                           cw=int(H*target); x0=(W-cw)//2; crop=im.crop((x0,0,x0+cw,H))
@@ -191,9 +189,6 @@ jobs:
           files=recursive_files(ROOT,max_depth=6,max_files=700)
           print('Price-tag category tree files:',len(files))
 
-          # If the category tree itself is too small, append real Prague supermarket
-          # interiors; these are still genuine photographs and are cropped around the
-          # largest OCR-detected numeric shelf label.
           if len(files)<TARGET*2:
               fallback=recursive_files(FALLBACK,max_depth=2,max_files=350)
               known={x[0] for x in files}
@@ -212,9 +207,6 @@ jobs:
                   download(info['thumb'],raw); normalize(raw,norm)
                   rows=tsv(norm)
                   expected,expected_source=parse_expected(info)
-                  # Files reached through the actual Price-tags category tree are accepted
-                  # without demanding that Tesseract already succeeds on them. That is the
-                  # point of keeping them as regression fixtures.
                   in_price_tree='Price tags' in parent or any('Price tags' in c or '(price tag)' in c for c in info['categories'])
                   has_numeric=any(re.search(r'\d',r['text']) for r in rows)
                   if not in_price_tree and not has_numeric:
@@ -282,6 +274,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # A push created by GITHUB_TOKEN intentionally does not trigger another workflow.
-          # workflow_dispatch is the documented exception, so invoke Pages explicitly.
           gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref master
