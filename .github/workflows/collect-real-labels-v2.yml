@@ -1,0 +1,287 @@
+name: Collect 20 real Czech price labels v2
+
+on:
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/collect-real-labels-v2.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install image/OCR tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-ces
+          python3 -m pip install --quiet pillow
+
+      - name: Collect 20 permanent real Czech price-label fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import html, json, math, re, shutil, subprocess, time, urllib.parse, urllib.request
+          from collections import deque
+          from pathlib import Path
+          from PIL import Image, ImageOps, ImageDraw
+
+          API='https://commons.wikimedia.org/w/api.php'
+          UA='czk-pln-real-label-fixtures/2.0 (GitHub Actions)'
+          ROOT='Category:Price tags in the Czech Republic'
+          FALLBACK='Category:Interiors of supermarkets in Prague'
+          OUT=Path('czk-pln/real-labels')
+          TMP=Path('/tmp/czk-real-labels-v2')
+          TARGET=20
+
+          def api(params):
+              q=dict(params); q.update(format='json',formatversion='2')
+              req=urllib.request.Request(API+'?'+urllib.parse.urlencode(q),headers={'User-Agent':UA})
+              with urllib.request.urlopen(req,timeout=40) as r:
+                  return json.load(r)
+
+          def category_members(category, types='file|subcat'):
+              cont=None
+              while True:
+                  p={'action':'query','list':'categorymembers','cmtitle':category,'cmtype':types,'cmlimit':'max'}
+                  if cont: p['cmcontinue']=cont
+                  j=api(p)
+                  for x in j.get('query',{}).get('categorymembers',[]):
+                      yield x
+                  cont=j.get('continue',{}).get('cmcontinue')
+                  if not cont: break
+
+          def recursive_files(root,max_depth=5,max_files=500):
+              q=deque([(root,0)])
+              seen_cat=set(); seen_file=set(); out=[]
+              while q and len(out)<max_files:
+                  cat,depth=q.popleft()
+                  if cat in seen_cat or depth>max_depth: continue
+                  seen_cat.add(cat)
+                  try:
+                      members=list(category_members(cat))
+                  except Exception as e:
+                      print('WARN category',cat,e); continue
+                  for x in members:
+                      title=x.get('title','')
+                      ns=x.get('ns')
+                      if ns==14 and depth<max_depth:
+                          q.append((title,depth+1))
+                      elif ns==6 and title not in seen_file:
+                          seen_file.add(title); out.append((title,cat))
+                  time.sleep(.08)
+              return out
+
+          def file_info(title,parent_category):
+              j=api({'action':'query','titles':title,'prop':'imageinfo|categories','iiprop':'url|mime|extmetadata','iiurlwidth':1800,'cllimit':'max'})
+              pages=j.get('query',{}).get('pages',[])
+              if not pages: return None
+              p=pages[0]; ii=(p.get('imageinfo') or [{}])[0]
+              if ii.get('mime') not in ('image/jpeg','image/png','image/webp'): return None
+              ext=ii.get('extmetadata') or {}
+              def mv(k):
+                  v=ext.get(k,{})
+                  if isinstance(v,dict): v=v.get('value','')
+                  return re.sub(r'<[^>]+>',' ',html.unescape(str(v or ''))).strip()
+              cats=[c.get('title','') for c in p.get('categories',[])]
+              return {
+                  'title':title,
+                  'parent_category':parent_category,
+                  'thumb':ii.get('thumburl') or ii.get('url'),
+                  'original':ii.get('url'),
+                  'source_page':'https://commons.wikimedia.org/wiki/'+urllib.parse.quote(title.replace(' ','_'),safe=':/_()'),
+                  'author':mv('Artist'),
+                  'license':mv('LicenseShortName'),
+                  'license_url':mv('LicenseUrl'),
+                  'description':mv('ImageDescription'),
+                  'categories':cats,
+              }
+
+          def download(url,path):
+              req=urllib.request.Request(url,headers={'User-Agent':UA})
+              with urllib.request.urlopen(req,timeout=60) as r:
+                  data=r.read(15*1024*1024+1)
+              if len(data)>15*1024*1024: raise RuntimeError('image too large')
+              path.write_bytes(data)
+
+          def normalize(src,dst):
+              with Image.open(src) as im:
+                  im=ImageOps.exif_transpose(im).convert('RGB')
+                  im.thumbnail((1800,1800),Image.Resampling.LANCZOS)
+                  im.save(dst,'JPEG',quality=91,optimize=True)
+
+          def tsv(path):
+              p=subprocess.run(['tesseract',str(path),'stdout','-l','ces+eng','--psm','11','tsv'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=60)
+              lines=p.stdout.splitlines(); rows=[]
+              if not lines: return rows
+              hdr=lines[0].split('\t')
+              for line in lines[1:]:
+                  cols=line.split('\t')
+                  if len(cols)!=len(hdr): continue
+                  d=dict(zip(hdr,cols)); text=(d.get('text') or '').strip()
+                  if not text: continue
+                  try:
+                      for k in ('left','top','width','height'): d[k]=int(d[k])
+                      d['conf']=float(d['conf'])
+                  except: continue
+                  rows.append(d)
+              return rows
+
+          def parse_expected(info):
+              # Wikimedia often classifies price-tag photos in categories such as
+              # "49.90 (price tag)". This is much stronger ground truth than OCR.
+              for c in [info['parent_category']]+info['categories']:
+                  m=re.search(r'Category:(\d{1,4})[\.,](\d{2})\s*\(price tag\)',c,re.I)
+                  if m:
+                      v=int(m.group(1))+int(m.group(2))/100
+                      if .05<v<100000: return round(v,2),c
+              return None,None
+
+          def largest_numeric(rows):
+              nums=[]
+              for r in rows:
+                  if re.search(r'\d',r['text']) and r['conf']>=5:
+                      area=max(1,r['width']*r['height'])
+                      nums.append((area,r))
+              return max(nums,key=lambda x:x[0])[1] if nums else None
+
+          def crop_real(src,dst,rows):
+              with Image.open(src) as im:
+                  im=im.convert('RGB'); W,H=im.size
+                  a=largest_numeric(rows)
+                  if a:
+                      cx=a['left']+a['width']/2; cy=a['top']+a['height']/2
+                      ch=min(H,max(180,int(a['height']*6.0)))
+                      cw=min(W,max(450,int(ch*2.5)))
+                      ch=min(H,max(1,int(cw/2.5)))
+                      x0=max(0,min(W-cw,int(cx-cw*.45)))
+                      y0=max(0,min(H-ch,int(cy-ch*.50)))
+                      crop=im.crop((x0,y0,x0+cw,y0+ch))
+                  else:
+                      # Still keep the REAL photograph if Tesseract cannot find a number.
+                      target=2.5
+                      if W/H>target:
+                          cw=int(H*target); x0=(W-cw)//2; crop=im.crop((x0,0,x0+cw,H))
+                      else:
+                          ch=int(W/target); y0=(H-ch)//2; crop=im.crop((0,y0,W,y0+ch))
+                  crop=crop.resize((900,360),Image.Resampling.LANCZOS)
+                  crop.save(dst,'JPEG',quality=93,optimize=True)
+
+          def diagnostic(rows):
+              return ' '.join(r['text'] for r in rows)[:600]
+
+          shutil.rmtree(TMP,ignore_errors=True); TMP.mkdir(parents=True)
+          OUT.mkdir(parents=True,exist_ok=True)
+          for p in OUT.glob('real-*.jpg'): p.unlink()
+          for n in ('manifest.json','SOURCES.md'):
+              p=OUT/n
+              if p.exists(): p.unlink()
+
+          files=recursive_files(ROOT,max_depth=6,max_files=700)
+          print('Price-tag category tree files:',len(files))
+
+          # If the category tree itself is too small, append real Prague supermarket
+          # interiors; these are still genuine photographs and are cropped around the
+          # largest OCR-detected numeric shelf label.
+          if len(files)<TARGET*2:
+              fallback=recursive_files(FALLBACK,max_depth=2,max_files=350)
+              known={x[0] for x in files}
+              files.extend(x for x in fallback if x[0] not in known)
+              print('With supermarket fallback:',len(files))
+
+          accepted=[]; seen_titles=set()
+          for idx,(title,parent) in enumerate(files,1):
+              if len(accepted)>=TARGET: break
+              if title in seen_titles: continue
+              seen_titles.add(title)
+              try:
+                  info=file_info(title,parent)
+                  if not info or not info['thumb']: continue
+                  raw=TMP/f'{idx:04d}.bin'; norm=TMP/f'{idx:04d}.jpg'
+                  download(info['thumb'],raw); normalize(raw,norm)
+                  rows=tsv(norm)
+                  expected,expected_source=parse_expected(info)
+                  # Files reached through the actual Price-tags category tree are accepted
+                  # without demanding that Tesseract already succeeds on them. That is the
+                  # point of keeping them as regression fixtures.
+                  in_price_tree='Price tags' in parent or any('Price tags' in c or '(price tag)' in c for c in info['categories'])
+                  has_numeric=any(re.search(r'\d',r['text']) for r in rows)
+                  if not in_price_tree and not has_numeric:
+                      continue
+                  number=len(accepted)+1; fn=f'real-{number:02d}.jpg'
+                  crop_real(norm,OUT/fn,rows)
+                  item={
+                      'name':title.removeprefix('File:'),
+                      'file':'./real-labels/'+fn,
+                      'expected':expected,
+                      'expected_source':expected_source,
+                      'source_page':info['source_page'],
+                      'original_url':info['original'],
+                      'author':info['author'],
+                      'license':info['license'],
+                      'license_url':info['license_url'],
+                      'description':info['description'],
+                      'parent_category':parent,
+                      'ocr_preview_unverified':diagnostic(rows),
+                  }
+                  accepted.append(item)
+                  print('ACCEPT',number,title,'expected=',expected)
+              except Exception as e:
+                  print('WARN',title,e)
+
+          if len(accepted)<TARGET:
+              raise SystemExit(f'Collected only {len(accepted)}/{TARGET}; no incomplete commit will be made')
+
+          manifest={
+              'type':'real-czech-price-label-fixtures',
+              'count':len(accepted),
+              'ground_truth_note':'expected is populated only when Wikimedia category metadata explicitly encodes a price; OCR preview is diagnostic and never ground truth.',
+              'labels':accepted,
+          }
+          (OUT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+
+          lines=['# 20 real Czech price-label fixtures','',
+                 'All JPEG files here are crops derived from real photographs on Wikimedia Commons — none are synthetic.',
+                 'Source, author and licence are retained below.','',
+                 '| # | File | Source | Expected from Commons metadata | Author | Licence |',
+                 '|---:|---|---|---:|---|---|']
+          for i,x in enumerate(accepted,1):
+              name=x['name'].replace('|','\\|'); author=(x['author'] or '—').replace('|','\\|'); lic=(x['license'] or '—').replace('|','\\|')
+              exp='—' if x['expected'] is None else f"{x['expected']:.2f} Kč"
+              lines.append(f'| {i} | `real-{i:02d}.jpg` | [{name}]({x["source_page"]}) | {exp} | {author} | {lic} |')
+          (OUT/'SOURCES.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+          print('DONE',len(accepted),'real fixtures')
+          PY
+
+      - name: Commit the 20 real photos to master
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add czk-pln/real-labels
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Add 20 real Czech price label fixtures"
+            git push origin HEAD:master
+          fi
+
+      - name: Deploy the committed fixtures through Pages workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A push created by GITHUB_TOKEN intentionally does not trigger another workflow.
+          # workflow_dispatch is the documented exception, so invoke Pages explicitly.
+          gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref master
