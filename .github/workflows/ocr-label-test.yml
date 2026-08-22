@@ -1,0 +1,108 @@
+name: OCR real Czech label test
+
+on:
+  push:
+    paths:
+      - '.github/workflows/ocr-label-test.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install OCR test dependencies
+        run: npm install --no-save tesseract.js@6.0.1 sharp@0.33.5
+      - name: Run 12 real-label OCR tests
+        shell: bash
+        run: |
+          cat > /tmp/ocr-test.mjs <<'JS'
+          import fs from 'node:fs/promises';
+          import path from 'node:path';
+          import {execFile} from 'node:child_process';
+          import {promisify} from 'node:util';
+          import sharp from 'sharp';
+          import {createWorker} from 'tesseract.js';
+          const execFileP=promisify(execFile);
+
+          const sources={
+            tescoStore:'https://1884403144.rsc.cdn77.org/foto/cukr-obchod-supermarket-drahota-zdrazeni/Zml0LWluLzk3OHg5OTk5L2ZpbHRlcnM6cXVhbGl0eSg4NSk6bm9fdXBzY2FsZSgpL2ltZw/8009205.jpg?e=0&st=rMPIIpzmzBIc9dopSfYZr0XbN48aJVbKnbYSAenGaOQ&ts=1600812000&v=0',
+            cokeSign:'https://d15-a.sdn.cz/d_15/c_img_oc_A/kcukOQcMmCfTdKCWrEDISWN/acd1/slevy.jpeg',
+            pennyJan:'https://cz2.staticac.cz/foto/letaky/183051/l18305101.jpg',
+            pennyJul:'https://assets-eu-01.kc-usercontent.com/b490fe50-3436-01c5-6cd3-1e0fc2fff5ea/469bdbd5-6706-440b-8e7d-b3c3a5558ce3/31KW_ONE_29_07_2026_148mm_WEB_leaflet_page-0001.jpg?fm=webp&lossless=0&q=80&w=875',
+            pennyApr:'https://img.kupi.cz/letaky/347919/thumbs/penny-market-letak-2_1500.jpg',
+            tescoFlyer:'https://archiv.kompasslev.cz/kompasslev.cz/public/gimg/4/9/8/9/1/7/0/4989170-1080-1080.jpg',
+            lidl:'https://img.najdislevu.cz/letaky/lidl/letak47598/strana1.jpg'
+          };
+
+          // x,y,w,h are fractions of source image. Crops intentionally include a little context,
+          // similar to aiming the PWA scan frame at a single shelf/flyer price.
+          const tests=[
+            {name:'Tesco in-store Clubcard 29,90',src:'tescoStore',expected:29.90,r:[.36,.17,.38,.28]},
+            {name:'Coca-Cola sign 49,90',src:'cokeSign',expected:49.90,r:[.27,.54,.48,.38]},
+            {name:'Penny quark 9,90',src:'pennyJan',expected:9.90,r:[.55,.00,.40,.35]},
+            {name:'Penny grapes 37,90',src:'pennyJan',expected:37.90,r:[.03,.34,.29,.26]},
+            {name:'Penny milk 14,90',src:'pennyJan',expected:14.90,r:[.70,.30,.27,.30]},
+            {name:'Penny toilet paper 29,90',src:'pennyJul',expected:29.90,r:[.56,.01,.41,.42]},
+            {name:'Penny tomatoes 49,90',src:'pennyApr',expected:49.90,r:[.14,.00,.24,.22]},
+            {name:'Penny grapes 69,90',src:'pennyApr',expected:69.90,r:[.49,.00,.25,.22]},
+            {name:'Tesco Hermelin 29,90',src:'tescoFlyer',expected:29.90,r:[.58,.00,.28,.28]},
+            {name:'Tesco cucumber 11,90',src:'tescoFlyer',expected:11.90,r:[.57,.23,.26,.28]},
+            {name:'Lidl Rama 39,90',src:'lidl',expected:39.90,r:[.00,.00,.36,.35]},
+            {name:'Lidl Radegast 19,90',src:'lidl',expected:19.90,r:[.00,.36,.35,.38]}
+          ];
+
+          await fs.mkdir('/tmp/ocrimgs',{recursive:true});
+          const local={};
+          for(const [key,url] of Object.entries(sources)){
+            const f=`/tmp/ocrimgs/${key}.img`;
+            console.log(`DOWNLOAD ${key}`);
+            await execFileP('curl',['-fL','--retry','2','-A','Mozilla/5.0',url,'-o',f],{maxBuffer:1024*1024});
+            local[key]=f;
+          }
+
+          function cleanText(t){return String(t||'').replace(/[Oo]/g,'0').replace(/[Il|]/g,'1').replace(/\s/g,'')}
+          function num(v){v=String(v??'').trim().replace(/\s/g,'').replace(',','.').replace(/[^0-9.]/g,'');let p=v.split('.');if(p.length>2)v=p.shift()+'.'+p.join('');let n=Number(v);return Number.isFinite(n)?n:NaN}
+          function flattenWords(data){const out=[],seen=new Set();const add=w=>{if(!w||typeof w.text!=='string'||!w.bbox)return;const b=w.bbox,key=[w.text,b.x0,b.y0,b.x1,b.y1].join('|');if(seen.has(key))return;seen.add(key);out.push(w)};if(Array.isArray(data.words))data.words.forEach(add);for(const b of (data.blocks||[]))for(const p of (b.paragraphs||[]))for(const l of (p.lines||[]))for(const w of (l.words||[]))add(w);return out}
+          function boxInfo(w){const b=w.bbox,h=Math.max(1,b.y1-b.y0),wid=Math.max(1,b.x1-b.x0);return{b,h,wid,cx:(b.x0+b.x1)/2,cy:(b.y0+b.y1)/2}}
+          function candidateScore(n,b,conf,bonus,cw,ch){const cx=cw/2,cy=ch/2,diag=Math.hypot(cx,cy)||1,mx=(b.x0+b.x1)/2,my=(b.y0+b.y1)/2,dist=Math.hypot(mx-cx,my-cy)/diag,area=Math.max(1,(b.x1-b.x0)*(b.y1-b.y0))/(cw*ch);return{n,score:(1-dist)*7+Math.min(area*35,2.5)+(conf/100)*2+bonus,confidence:conf,dist}}
+          function fallbackCandidates(text){text=cleanText(text);let m=text.match(/\d{1,5}[.,]\d{2}/g)||[],a=[];for(let s of m){let n=num(s);if(n>.05&&n<100000)a.push({n,score:4,confidence:0,text:s,kind:'fallback'})}return a}
+          function chooseCandidate(data,cw,ch,confidence=45){
+            const words=flattenWords(data),a=[],usable=[];
+            for(const w of words){const t=cleanText(w.text),conf=Number(w.confidence??0),bi=boxInfo(w);if(conf<Math.max(10,confidence-10))continue;usable.push({w,t,conf,...bi});const full=t.match(/(?:^|[^0-9])(\d{1,5}[.,]\d{2})(?:[^0-9]|$)/);if(full){const n=num(full[1]);if(n>.05&&n<100000){const c=candidateScore(n,bi.b,conf,3.2,cw,ch);c.text=full[1];c.kind='decimal';a.push(c)}}}
+            for(const main of usable){if(!/^\d{1,5}$/.test(main.t)||main.conf<confidence)continue;const whole=Number(main.t);if(!(whole>=0&&whole<100000))continue;for(const cents of usable){if(cents===main||!/^\d{2}$/.test(cents.t))continue;const ratio=cents.h/main.h;if(ratio<.28||ratio>.82)continue;const gap=cents.b.x0-main.b.x1;if(gap<-(main.wid*.08)||gap>Math.max(main.h*1.15,main.wid*.38))continue;if(cents.cx<=main.cx)continue;const vertical=Math.abs(cents.cy-main.cy);if(vertical>main.h*.62)continue;if(cents.b.y1>main.b.y1+main.h*.18)continue;const decimal=Number(cents.t);if(decimal<0||decimal>99)continue;const n=whole+decimal/100;const b={x0:Math.min(main.b.x0,cents.b.x0),y0:Math.min(main.b.y0,cents.b.y0),x1:Math.max(main.b.x1,cents.b.x1),y1:Math.max(main.b.y1,cents.b.y1)};const conf=Math.min(main.conf,cents.conf),closeness=Math.max(0,1-Math.max(0,gap)/(main.h*1.15)),sizeBonus=Math.max(0,1-Math.abs(ratio-.55));const c=candidateScore(n,b,conf,2.5+closeness+sizeBonus,cw,ch);c.text=`${main.t},${cents.t}`;c.kind='split';a.push(c)}}
+            for(const w of usable){if(!/^\d{1,5}$/.test(w.t)||w.conf<confidence)continue;const n=Number(w.t);if(!(n>.05&&n<100000))continue;const c=candidateScore(n,w.b,w.conf,0,cw,ch);c.text=w.t;c.kind='whole';a.push(c)}
+            if(!a.length)a.push(...fallbackCandidates(data.text));a.sort((x,y)=>y.score-x.score);return {best:a[0]||null,all:a,words:usable};
+          }
+
+          const worker=await createWorker('eng',1,{logger:m=>{if(m.status==='recognizing text'&&m.progress===1)process.stdout.write('.')}});
+          await worker.setParameters({tessedit_char_whitelist:'0123456789,.',tessedit_pageseg_mode:'7',preserve_interword_spaces:'1'});
+          let pass=0;
+          const rows=[];
+          let i=0;
+          for(const t of tests){
+            i++;
+            const meta=await sharp(local[t.src]).metadata();
+            const [rx,ry,rw,rh]=t.r;
+            const left=Math.max(0,Math.floor(meta.width*rx)),top=Math.max(0,Math.floor(meta.height*ry));
+            const width=Math.min(meta.width-left,Math.floor(meta.width*rw)),height=Math.min(meta.height-top,Math.floor(meta.height*rh));
+            const out=`/tmp/ocrimgs/crop-${String(i).padStart(2,'0')}.png`;
+            await sharp(local[t.src]).extract({left,top,width,height}).resize({width:800,fit:'inside',withoutEnlargement:false}).grayscale().linear(1.7,-89.6).png().toFile(out);
+            const m=await sharp(out).metadata();
+            const r=await worker.recognize(out,{}, {text:true,blocks:true});
+            const chosen=chooseCandidate(r.data,m.width,m.height,45).best;
+            const got=chosen?.n ?? null;
+            const ok=got!==null && Math.abs(got-t.expected)<0.011;
+            if(ok)pass++;
+            rows.push({name:t.name,expected:t.expected,got,ok,kind:chosen?.kind||null,raw:(r.data.text||'').trim().replace(/\s+/g,' ')});
+            console.log(`\n${ok?'PASS':'FAIL'} ${i}. ${t.name}: expected=${t.expected.toFixed(2)} got=${got===null?'NONE':got.toFixed(2)} kind=${chosen?.kind||'-'} raw=${JSON.stringify(rows.at(-1).raw)}`);
+          }
+          await worker.terminate();
+          console.log(`\nSUMMARY ${pass}/${tests.length} PASS`);
+          console.log('RESULT_JSON '+JSON.stringify({pass,total:tests.length,rows}));
+          if(pass<tests.length) process.exitCode=1;
+          JS
+          node /tmp/ocr-test.mjs
