@@ -15,7 +15,7 @@ permissions:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -33,37 +33,66 @@ jobs:
         run: |
           set -euo pipefail
           python3 <<'PY'
-          import html, json, math, re, shutil, subprocess, time, urllib.parse, urllib.request
+          import html, json, math, re, shutil, subprocess, time, urllib.parse, urllib.request, urllib.error
           from collections import deque
           from pathlib import Path
-          from PIL import Image, ImageOps, ImageDraw
+          from PIL import Image, ImageOps
 
           API='https://commons.wikimedia.org/w/api.php'
-          UA='czk-pln-real-label-fixtures/2.0 (GitHub Actions)'
+          UA='czk-pln-real-label-fixtures/3.0 (+https://github.com/chuck101/hello)'
           ROOT='Category:Price tags in the Czech Republic'
-          FALLBACK='Category:Interiors of supermarkets in Prague'
           OUT=Path('czk-pln/real-labels')
-          TMP=Path('/tmp/czk-real-labels-v2')
+          TMP=Path('/tmp/czk-real-labels-v3')
           TARGET=20
 
-          def api(params):
-              q=dict(params); q.update(format='json',formatversion='2')
-              req=urllib.request.Request(API+'?'+urllib.parse.urlencode(q),headers={'User-Agent':UA})
-              with urllib.request.urlopen(req,timeout=40) as r:
-                  return json.load(r)
+          def open_retry(url, timeout=60, max_bytes=None, attempts=6):
+              last=None
+              for attempt in range(attempts):
+                  try:
+                      req=urllib.request.Request(url,headers={
+                          'User-Agent':UA,
+                          'Accept':'application/json,image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                      })
+                      with urllib.request.urlopen(req,timeout=timeout) as r:
+                          data=r.read((max_bytes+1) if max_bytes else None)
+                          if max_bytes and len(data)>max_bytes:
+                              raise RuntimeError('download too large')
+                          return data
+                  except urllib.error.HTTPError as e:
+                      last=e
+                      if e.code!=429:
+                          raise
+                      retry=e.headers.get('Retry-After') if e.headers else None
+                      try: delay=max(8,int(retry)) if retry else min(60,8*(2**attempt))
+                      except: delay=min(60,8*(2**attempt))
+                      print(f'HTTP 429; sleeping {delay}s before retry {attempt+2}/{attempts}',flush=True)
+                      time.sleep(delay)
+                  except Exception as e:
+                      last=e
+                      if attempt==attempts-1: raise
+                      delay=min(30,3*(attempt+1))
+                      print(f'Network error {e}; sleeping {delay}s',flush=True)
+                      time.sleep(delay)
+              raise last or RuntimeError('request failed')
 
-          def category_members(category, types='file|subcat'):
+          def api(params):
+              q=dict(params); q.update(format='json',formatversion='2',maxlag='5')
+              url=API+'?'+urllib.parse.urlencode(q)
+              data=open_retry(url,timeout=45,attempts=6)
+              time.sleep(1.1)
+              return json.loads(data.decode('utf-8'))
+
+          def category_members(category):
               cont=None
               while True:
-                  p={'action':'query','list':'categorymembers','cmtitle':category,'cmtype':types,'cmlimit':'max'}
+                  p={'action':'query','list':'categorymembers','cmtitle':category,'cmtype':'file|subcat','cmlimit':'max'}
                   if cont: p['cmcontinue']=cont
                   j=api(p)
-                  for x in j.get('query',{}).get('categorymembers',[]):
-                      yield x
+                  yield from j.get('query',{}).get('categorymembers',[])
                   cont=j.get('continue',{}).get('cmcontinue')
                   if not cont: break
 
-          def recursive_files(root,max_depth=5,max_files=500):
+          def recursive_files(root,max_depth=6,max_files=500):
               q=deque([(root,0)])
               seen_cat=set(); seen_file=set(); out=[]
               while q and len(out)<max_files:
@@ -73,71 +102,65 @@ jobs:
                   try:
                       members=list(category_members(cat))
                   except Exception as e:
-                      print('WARN category',cat,e); continue
+                      print('WARN category',cat,e,flush=True); continue
                   for x in members:
-                      title=x.get('title','')
-                      ns=x.get('ns')
+                      title=x.get('title',''); ns=x.get('ns')
                       if ns==14 and depth<max_depth:
                           q.append((title,depth+1))
                       elif ns==6 and title not in seen_file:
                           seen_file.add(title); out.append((title,cat))
-                  time.sleep(.08)
               return out
 
-          def file_info(title,parent_category):
-              j=api({'action':'query','titles':title,'prop':'imageinfo|categories','iiprop':'url|mime|extmetadata','iiurlwidth':1800,'cllimit':'max'})
-              pages=j.get('query',{}).get('pages',[])
-              if not pages: return None
-              p=pages[0]; ii=(p.get('imageinfo') or [{}])[0]
-              if ii.get('mime') not in ('image/jpeg','image/png','image/webp'): return None
-              ext=ii.get('extmetadata') or {}
-              def mv(k):
-                  v=ext.get(k,{})
-                  if isinstance(v,dict): v=v.get('value','')
-                  return re.sub(r'<[^>]+>',' ',html.unescape(str(v or ''))).strip()
-              cats=[c.get('title','') for c in p.get('categories',[])]
-              return {
-                  'title':title,
-                  'parent_category':parent_category,
-                  'thumb':ii.get('thumburl') or ii.get('url'),
-                  'original':ii.get('url'),
-                  'source_page':'https://commons.wikimedia.org/wiki/'+urllib.parse.quote(title.replace(' ','_'),safe=':/_()'),
-                  'author':mv('Artist'),
-                  'license':mv('LicenseShortName'),
-                  'license_url':mv('LicenseUrl'),
-                  'description':mv('ImageDescription'),
-                  'categories':cats,
-              }
+          def strip_html(s):
+              return re.sub(r'<[^>]+>',' ',html.unescape(str(s or ''))).strip()
 
-          def download(url,path):
-              req=urllib.request.Request(url,headers={'User-Agent':UA})
-              with urllib.request.urlopen(req,timeout=60) as r:
-                  data=r.read(15*1024*1024+1)
-              if len(data)>15*1024*1024: raise RuntimeError('image too large')
-              path.write_bytes(data)
+          def batch_file_info(file_pairs):
+              # Key improvement: metadata for up to 25 files in ONE Commons API call,
+              # instead of one request per file. This avoids the 429 storm.
+              by_title={title:parent for title,parent in file_pairs}
+              out=[]
+              titles=list(by_title)
+              for start in range(0,len(titles),25):
+                  chunk=titles[start:start+25]
+                  j=api({
+                      'action':'query',
+                      'titles':'|'.join(chunk),
+                      'prop':'imageinfo|categories',
+                      'iiprop':'url|mime|extmetadata',
+                      'iiurlwidth':'1100',
+                      'cllimit':'max',
+                  })
+                  for p in j.get('query',{}).get('pages',[]):
+                      title=p.get('title','')
+                      ii=(p.get('imageinfo') or [{}])[0]
+                      if ii.get('mime') not in ('image/jpeg','image/png','image/webp'): continue
+                      ext=ii.get('extmetadata') or {}
+                      def mv(k):
+                          v=ext.get(k,{})
+                          if isinstance(v,dict): v=v.get('value','')
+                          return strip_html(v)
+                      out.append({
+                          'title':title,
+                          'parent_category':by_title.get(title,''),
+                          'thumb':ii.get('thumburl') or ii.get('url'),
+                          'original':ii.get('url'),
+                          'source_page':'https://commons.wikimedia.org/wiki/'+urllib.parse.quote(title.replace(' ','_'),safe=':/_()'),
+                          'author':mv('Artist'),
+                          'license':mv('LicenseShortName'),
+                          'license_url':mv('LicenseUrl'),
+                          'description':mv('ImageDescription'),
+                          'categories':[c.get('title','') for c in p.get('categories',[])],
+                      })
+              return out
 
-          def normalize(src,dst):
-              with Image.open(src) as im:
-                  im=ImageOps.exif_transpose(im).convert('RGB')
-                  im.thumbnail((1800,1800),Image.Resampling.LANCZOS)
-                  im.save(dst,'JPEG',quality=91,optimize=True)
+          SHOP_WORDS=('penny','lidl','tesco','billa','albert','kaufland','supermarket','prodejna','obchod','mléko','potravin','pečivo','pekárna','market')
 
-          def tsv(path):
-              p=subprocess.run(['tesseract',str(path),'stdout','-l','ces+eng','--psm','11','tsv'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=60)
-              lines=p.stdout.splitlines(); rows=[]
-              if not lines: return rows
-              hdr=lines[0].split('\t')
-              for line in lines[1:]:
-                  cols=line.split('\t')
-                  if len(cols)!=len(hdr): continue
-                  d=dict(zip(hdr,cols)); text=(d.get('text') or '').strip()
-                  if not text: continue
-                  try:
-                      for k in ('left','top','width','height'): d[k]=int(d[k])
-                      d['conf']=float(d['conf'])
-                  except: continue
-                  rows.append(d)
-              return rows
+          def rank(info):
+              blob=(' '.join([info['title'],info['parent_category'],info['description'],*info['categories']])).lower()
+              score=sum(8 for x in SHOP_WORDS if x in blob)
+              if '(price tag)' in blob: score+=5
+              if 'price tags in the czech republic' in blob: score+=4
+              return score
 
           def parse_expected(info):
               for c in [info['parent_category']]+info['categories']:
@@ -147,18 +170,45 @@ jobs:
                       if .05<v<100000: return round(v,2),c
               return None,None
 
+          def download(url,path):
+              data=open_retry(url,timeout=70,max_bytes=12*1024*1024,attempts=6)
+              path.write_bytes(data)
+              # Be deliberately polite to upload.wikimedia.org.
+              time.sleep(2.5)
+
+          def normalize(src,dst):
+              with Image.open(src) as im:
+                  im=ImageOps.exif_transpose(im).convert('RGB')
+                  im.thumbnail((1200,1200),Image.Resampling.LANCZOS)
+                  im.save(dst,'JPEG',quality=91,optimize=True)
+
+          def tsv(path):
+              p=subprocess.run(['tesseract',str(path),'stdout','-l','ces+eng','--psm','11','tsv'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=60)
+              lines=p.stdout.splitlines(); rows=[]
+              if not lines:return rows
+              hdr=lines[0].split('\t')
+              for line in lines[1:]:
+                  cols=line.split('\t')
+                  if len(cols)!=len(hdr):continue
+                  d=dict(zip(hdr,cols)); text=(d.get('text') or '').strip()
+                  if not text:continue
+                  try:
+                      for k in ('left','top','width','height'): d[k]=int(d[k])
+                      d['conf']=float(d['conf'])
+                  except:continue
+                  rows.append(d)
+              return rows
+
           def largest_numeric(rows):
               nums=[]
               for r in rows:
-                  if re.search(r'\d',r['text']) and r['conf']>=5:
-                      area=max(1,r['width']*r['height'])
-                      nums.append((area,r))
+                  if re.search(r'\d',r['text']) and r['conf']>=0:
+                      nums.append((max(1,r['width']*r['height']),r))
               return max(nums,key=lambda x:x[0])[1] if nums else None
 
           def crop_real(src,dst,rows):
               with Image.open(src) as im:
-                  im=im.convert('RGB'); W,H=im.size
-                  a=largest_numeric(rows)
+                  im=im.convert('RGB'); W,H=im.size; a=largest_numeric(rows)
                   if a:
                       cx=a['left']+a['width']/2; cy=a['top']+a['height']/2
                       ch=min(H,max(180,int(a['height']*6.0)))
@@ -184,37 +234,34 @@ jobs:
           for p in OUT.glob('real-*.jpg'): p.unlink()
           for n in ('manifest.json','SOURCES.md'):
               p=OUT/n
-              if p.exists(): p.unlink()
+              if p.exists():p.unlink()
 
-          files=recursive_files(ROOT,max_depth=6,max_files=700)
-          print('Price-tag category tree files:',len(files))
+          files=recursive_files(ROOT,max_depth=6,max_files=350)
+          print('Price-tag category tree files:',len(files),flush=True)
+          if len(files)<TARGET:
+              raise SystemExit(f'Commons category tree has only {len(files)} files')
 
-          if len(files)<TARGET*2:
-              fallback=recursive_files(FALLBACK,max_depth=2,max_files=350)
-              known={x[0] for x in files}
-              files.extend(x for x in fallback if x[0] not in known)
-              print('With supermarket fallback:',len(files))
+          infos=batch_file_info(files)
+          infos.sort(key=lambda x:(-rank(x),x['title']))
+          print('Metadata loaded:',len(infos),'Top candidates:',[(rank(x),x['title']) for x in infos[:8]],flush=True)
 
-          accepted=[]; seen_titles=set()
-          for idx,(title,parent) in enumerate(files,1):
-              if len(accepted)>=TARGET: break
-              if title in seen_titles: continue
-              seen_titles.add(title)
+          accepted=[]
+          failures=0
+          # We only need 20 real images. Try at most 45 candidates so the job remains
+          # bounded even if some Wikimedia files are temporarily unavailable.
+          for idx,info in enumerate(infos[:45],1):
+              if len(accepted)>=TARGET:break
               try:
-                  info=file_info(title,parent)
-                  if not info or not info['thumb']: continue
-                  raw=TMP/f'{idx:04d}.bin'; norm=TMP/f'{idx:04d}.jpg'
-                  download(info['thumb'],raw); normalize(raw,norm)
+                  raw=TMP/f'{idx:03d}.bin'; norm=TMP/f'{idx:03d}.jpg'
+                  print(f'DOWNLOAD {idx}: {info["title"]}',flush=True)
+                  download(info['thumb'],raw)
+                  normalize(raw,norm)
                   rows=tsv(norm)
                   expected,expected_source=parse_expected(info)
-                  in_price_tree='Price tags' in parent or any('Price tags' in c or '(price tag)' in c for c in info['categories'])
-                  has_numeric=any(re.search(r'\d',r['text']) for r in rows)
-                  if not in_price_tree and not has_numeric:
-                      continue
                   number=len(accepted)+1; fn=f'real-{number:02d}.jpg'
                   crop_real(norm,OUT/fn,rows)
-                  item={
-                      'name':title.removeprefix('File:'),
+                  accepted.append({
+                      'name':info['title'].removeprefix('File:'),
                       'file':'./real-labels/'+fn,
                       'expected':expected,
                       'expected_source':expected_source,
@@ -224,16 +271,17 @@ jobs:
                       'license':info['license'],
                       'license_url':info['license_url'],
                       'description':info['description'],
-                      'parent_category':parent,
+                      'parent_category':info['parent_category'],
                       'ocr_preview_unverified':diagnostic(rows),
-                  }
-                  accepted.append(item)
-                  print('ACCEPT',number,title,'expected=',expected)
+                  })
+                  print('ACCEPT',number,info['title'],'expected=',expected,flush=True)
               except Exception as e:
-                  print('WARN',title,e)
+                  failures+=1
+                  print('WARN',info['title'],repr(e),flush=True)
+                  time.sleep(4)
 
           if len(accepted)<TARGET:
-              raise SystemExit(f'Collected only {len(accepted)}/{TARGET}; no incomplete commit will be made')
+              raise SystemExit(f'Collected only {len(accepted)}/{TARGET}; failures={failures}; no incomplete commit will be made')
 
           manifest={
               'type':'real-czech-price-label-fixtures',
@@ -253,7 +301,7 @@ jobs:
               exp='—' if x['expected'] is None else f"{x['expected']:.2f} Kč"
               lines.append(f'| {i} | `real-{i:02d}.jpg` | [{name}]({x["source_page"]}) | {exp} | {author} | {lic} |')
           (OUT/'SOURCES.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
-          print('DONE',len(accepted),'real fixtures')
+          print('DONE',len(accepted),'real fixtures',flush=True)
           PY
 
       - name: Commit the 20 real photos to master
