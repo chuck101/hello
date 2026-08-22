@@ -7,7 +7,7 @@
   const $=id=>document.getElementById(id);
   const settingsDlg=$('settingsDlg');
   const resetBtn=$('resetScan');
-  const pln=$('pln'),czk=$('czk'),rate=$('rate'),status=$('status');
+  const pln=$('pln'),czk=$('czk'),rate=$('rate');
   const cam=document.querySelector('.cam');
   const normalButtons=document.querySelector('.buttons');
   if(!settingsDlg||!resetBtn||!cam||!normalButtons) return;
@@ -29,12 +29,15 @@
   `;
   document.head.appendChild(style);
 
-  const launch=document.createElement('button');
-  launch.id='launchOcrTest';
-  launch.type='button';
-  launch.className='testLaunch';
-  launch.textContent='Testuj OCR na etykietach';
-  resetBtn.insertAdjacentElement('afterend',launch);
+  let launch=$('launchOcrTest');
+  if(!launch){
+    launch=document.createElement('button');
+    launch.id='launchOcrTest';
+    launch.type='button';
+    launch.className='testLaunch';
+    launch.textContent='Testuj OCR na etykietach';
+    resetBtn.insertAdjacentElement('afterend',launch);
+  }
 
   const viewer=document.createElement('div');
   viewer.className='testViewer';
@@ -49,18 +52,12 @@
   const img=$('testLabelImage'),info=$('testLabelInfo');
   const prev=$('testPrev'),next=$('testNext'),autoBtn=$('testAuto'),exitBtn=$('testExit');
 
-  let labels=[];
-  let index=0;
-  let active=false;
-  let auto=false;
-  let autoToken=0;
-  let results=[];
-
+  let labels=[],index=0,active=false,auto=false,autoToken=0,results=[];
   const fmt=n=>new Intl.NumberFormat('pl-PL',{minimumFractionDigits:2,maximumFractionDigits:2}).format(n);
   const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
   async function loadManifest(){
-    const r=await fetch('./test-labels/manifest.json',{cache:'no-store'}).catch(()=>null);
+    const r=await fetch('./test-labels/manifest.json?x='+(window.APP_VERSION||Date.now()),{cache:'no-store'}).catch(()=>null);
     if(!r||!r.ok) throw new Error('Nie udało się wczytać etykiet testowych');
     const j=await r.json();
     labels=Array.isArray(j.labels)?j.labels:[];
@@ -84,94 +81,39 @@
     canvas.width=w;canvas.height=h;
     ctx.drawImage(image,0,0,w,h);
     const im=ctx.getImageData(0,0,w,h),d=im.data,mul=cfg.contrast/10;
-    for(let i=0;i<d.length;i+=4){
-      const y=.299*d[i]+.587*d[i+1]+.114*d[i+2];
-      const c=Math.max(0,Math.min(255,(y-128)*mul+128));
-      d[i]=d[i+1]=d[i+2]=c;
-    }
+    for(let i=0;i<d.length;i+=4){const y=.299*d[i]+.587*d[i+1]+.114*d[i+2];const c=Math.max(0,Math.min(255,(y-128)*mul+128));d[i]=d[i+1]=d[i+2]=c}
     ctx.putImageData(im,0,0);
   }
 
   function paintResult(label,result){
-    const got=result?.got;
-    const ok=result?.ok===true;
-    const pending=!result;
+    const got=result?.got,ok=result?.ok===true,pending=!result;
     pln.textContent=pending?'TEST OCR':(ok?'✓ '+fmt(got):'✕ '+(got==null?'brak':fmt(got)));
     czk.textContent=`Oczekiwano ${fmt(label.expected)} Kč`;
     rate.textContent=`Etykieta ${index+1}/${labels.length} • ${label.name}`;
-    if(pending){
-      info.innerHTML=`<strong>${index+1}/${labels.length} — ${esc(label.name)}</strong><br>Oczekiwana cena: ${fmt(label.expected)} Kč<br>Analizuję…`;
-    }else{
-      info.innerHTML=`<strong>${ok?'✅ PASS':'❌ FAIL'} — ${esc(label.name)}</strong><br>Oczekiwano: ${fmt(label.expected)} Kč • OCR: ${got==null?'brak':fmt(got)+' Kč'} • tryb: ${esc(result.kind||'—')}<br>Surowy OCR: ${esc(result.raw||'—')}`;
-    }
+    info.innerHTML=pending
+      ? `<strong>${index+1}/${labels.length} — ${esc(label.name)}</strong><br>Oczekiwana cena: ${fmt(label.expected)} Kč<br>Analizuję…`
+      : `<strong>${ok?'✅ PASS':'❌ FAIL'} — ${esc(label.name)}</strong><br>Oczekiwano: ${fmt(label.expected)} Kč • OCR: ${got==null?'brak':fmt(got)+' Kč'} • tryb: ${esc(result.kind||'—')}<br>Surowy OCR: ${esc(result.raw||'—')}`;
   }
 
   async function analyze(i){
-    if(!active||!labels.length) return null;
-    index=(i+labels.length)%labels.length;
-    const label=labels[index];
-    paintResult(label,null);
+    if(!active||!labels.length)return null;
+    index=(i+labels.length)%labels.length;const label=labels[index];paintResult(label,null);
     try{
-      await loadImage(label.file);
-      preprocessImage(img);
+      await loadImage(label.file);preprocessImage(img);
       const w=await api.getWorker();
       const r=await w.recognize(api.canvas,{}, {text:true,blocks:true});
-      const chosen=api.chooseCandidate(r.data);
-      const got=chosen?.n??null;
-      const ok=got!==null&&Math.abs(got-Number(label.expected))<.011;
+      const chosen=api.chooseCandidate(r.data),got=chosen?.n??null,ok=got!==null&&Math.abs(got-Number(label.expected))<.011;
       const result={got,ok,kind:chosen?.kind||null,raw:(r.data.text||'').trim().replace(/\s+/g,' ')};
-      results[index]=result;
-      paintResult(label,result);
-      return result;
-    }catch(e){
-      const result={got:null,ok:false,kind:null,raw:'Błąd: '+(e.message||e)};
-      results[index]=result;
-      paintResult(label,result);
-      return result;
-    }
+      results[index]=result;paintResult(label,result);return result;
+    }catch(e){const result={got:null,ok:false,kind:null,raw:'Błąd: '+(e.message||e)};results[index]=result;paintResult(label,result);return result}
   }
 
-  function summary(){
-    const done=results.filter(Boolean);
-    const pass=done.filter(r=>r.ok).length;
-    const fail=done.length-pass;
-    pln.textContent=`${pass}/${labels.length} PASS`;
-    czk.textContent=fail?`${fail} błędnych`:'Wszystkie poprawne';
-    rate.textContent='Test OCR zakończony';
-    info.innerHTML=`<strong>Wynik AUTO: ${pass}/${labels.length}</strong><br>Poprawne: ${pass} • błędne: ${fail}. Użyj ←/→, aby obejrzeć konkretną etykietę i wynik.`;
-  }
+  function summary(){const done=results.filter(Boolean),pass=done.filter(r=>r.ok).length,fail=done.length-pass;pln.textContent=`${pass}/${labels.length} PASS`;czk.textContent=fail?`${fail} błędnych`:'Wszystkie poprawne';rate.textContent='Test OCR zakończony';info.innerHTML=`<strong>Wynik AUTO: ${pass}/${labels.length}</strong><br>Poprawne: ${pass} • błędne: ${fail}. Użyj ←/→, aby obejrzeć konkretną etykietę i wynik.`}
 
-  async function runAuto(){
-    if(auto){auto=false;autoToken++;autoBtn.textContent='AUTO';return;}
-    auto=true;autoBtn.textContent='STOP';
-    results=new Array(labels.length).fill(null);
-    const token=++autoToken;
-    for(let i=0;i<labels.length;i++){
-      if(!active||!auto||token!==autoToken) break;
-      await analyze(i);
-      await new Promise(r=>setTimeout(r,180));
-    }
-    if(active&&token===autoToken){auto=false;autoBtn.textContent='AUTO';summary();}
-  }
+  async function runAuto(){if(auto){auto=false;autoToken++;autoBtn.textContent='AUTO';return}auto=true;autoBtn.textContent='STOP';results=new Array(labels.length).fill(null);const token=++autoToken;for(let i=0;i<labels.length;i++){if(!active||!auto||token!==autoToken)break;await analyze(i);await new Promise(r=>setTimeout(r,180))}if(active&&token===autoToken){auto=false;autoBtn.textContent='AUTO';summary()}}
 
-  async function enter(){
-    try{
-      api.stop();
-      settingsDlg.close();
-      if(!labels.length) await loadManifest();
-      active=true;auto=false;autoToken++;
-      document.body.classList.add('ocrTest');
-      await analyze(index);
-    }catch(e){
-      alert(e.message||String(e));
-    }
-  }
-
-  function leave(){
-    active=false;auto=false;autoToken++;
-    document.body.classList.remove('ocrTest');
-    location.reload();
-  }
+  async function enter(){try{api.stop();settingsDlg.close();if(!labels.length)await loadManifest();active=true;auto=false;autoToken++;document.body.classList.add('ocrTest');await analyze(index)}catch(e){alert(e.message||String(e))}}
+  function leave(){active=false;auto=false;autoToken++;document.body.classList.remove('ocrTest');location.reload()}
 
   launch.addEventListener('click',enter);
   prev.addEventListener('click',()=>{auto=false;autoToken++;autoBtn.textContent='AUTO';analyze(index-1)});
