@@ -24,6 +24,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Bundle OCR files locally
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p czk-pln/ocr/core czk-pln/ocr/lang
+          curl -fL https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js -o czk-pln/ocr/tesseract.min.js
+          curl -fL https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/worker.min.js -o czk-pln/ocr/worker.min.js
+          for f in tesseract-core.wasm.js tesseract-core-simd.wasm.js tesseract-core-lstm.wasm.js tesseract-core-simd-lstm.wasm.js; do
+            curl -fL "https://cdn.jsdelivr.net/npm/tesseract.js-core@6.0.0/$f" -o "czk-pln/ocr/core/$f"
+          done
+          curl -fL https://tessdata.projectnaptha.com/4.0.0_fast/eng.traineddata.gz -o czk-pln/ocr/lang/eng.traineddata.gz
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
