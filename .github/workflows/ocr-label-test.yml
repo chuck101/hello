@@ -6,6 +6,9 @@ on:
       - '.github/workflows/ocr-label-test.yml'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -17,11 +20,12 @@ jobs:
       - name: Install OCR test dependencies
         run: npm install --no-save tesseract.js@6.0.1 sharp@0.33.5
       - name: Run 12 real-label OCR tests
+        id: ocr
+        continue-on-error: true
         shell: bash
         run: |
           cat > /tmp/ocr-test.mjs <<'JS'
           import fs from 'node:fs/promises';
-          import path from 'node:path';
           import {execFile} from 'node:child_process';
           import {promisify} from 'node:util';
           import sharp from 'sharp';
@@ -38,8 +42,6 @@ jobs:
             lidl:'https://img.najdislevu.cz/letaky/lidl/letak47598/strana1.jpg'
           };
 
-          // x,y,w,h are fractions of source image. Crops intentionally include a little context,
-          // similar to aiming the PWA scan frame at a single shelf/flyer price.
           const tests=[
             {name:'Tesco in-store Clubcard 29,90',src:'tescoStore',expected:29.90,r:[.36,.17,.38,.28]},
             {name:'Coca-Cola sign 49,90',src:'cokeSign',expected:49.90,r:[.27,.54,.48,.38]},
@@ -59,7 +61,6 @@ jobs:
           const local={};
           for(const [key,url] of Object.entries(sources)){
             const f=`/tmp/ocrimgs/${key}.img`;
-            console.log(`DOWNLOAD ${key}`);
             await execFileP('curl',['-fL','--retry','2','-A','Mozilla/5.0',url,'-o',f],{maxBuffer:1024*1024});
             local[key]=f;
           }
@@ -75,34 +76,48 @@ jobs:
             for(const w of words){const t=cleanText(w.text),conf=Number(w.confidence??0),bi=boxInfo(w);if(conf<Math.max(10,confidence-10))continue;usable.push({w,t,conf,...bi});const full=t.match(/(?:^|[^0-9])(\d{1,5}[.,]\d{2})(?:[^0-9]|$)/);if(full){const n=num(full[1]);if(n>.05&&n<100000){const c=candidateScore(n,bi.b,conf,3.2,cw,ch);c.text=full[1];c.kind='decimal';a.push(c)}}}
             for(const main of usable){if(!/^\d{1,5}$/.test(main.t)||main.conf<confidence)continue;const whole=Number(main.t);if(!(whole>=0&&whole<100000))continue;for(const cents of usable){if(cents===main||!/^\d{2}$/.test(cents.t))continue;const ratio=cents.h/main.h;if(ratio<.28||ratio>.82)continue;const gap=cents.b.x0-main.b.x1;if(gap<-(main.wid*.08)||gap>Math.max(main.h*1.15,main.wid*.38))continue;if(cents.cx<=main.cx)continue;const vertical=Math.abs(cents.cy-main.cy);if(vertical>main.h*.62)continue;if(cents.b.y1>main.b.y1+main.h*.18)continue;const decimal=Number(cents.t);if(decimal<0||decimal>99)continue;const n=whole+decimal/100;const b={x0:Math.min(main.b.x0,cents.b.x0),y0:Math.min(main.b.y0,cents.b.y0),x1:Math.max(main.b.x1,cents.b.x1),y1:Math.max(main.b.y1,cents.b.y1)};const conf=Math.min(main.conf,cents.conf),closeness=Math.max(0,1-Math.max(0,gap)/(main.h*1.15)),sizeBonus=Math.max(0,1-Math.abs(ratio-.55));const c=candidateScore(n,b,conf,2.5+closeness+sizeBonus,cw,ch);c.text=`${main.t},${cents.t}`;c.kind='split';a.push(c)}}
             for(const w of usable){if(!/^\d{1,5}$/.test(w.t)||w.conf<confidence)continue;const n=Number(w.t);if(!(n>.05&&n<100000))continue;const c=candidateScore(n,w.b,w.conf,0,cw,ch);c.text=w.t;c.kind='whole';a.push(c)}
-            if(!a.length)a.push(...fallbackCandidates(data.text));a.sort((x,y)=>y.score-x.score);return {best:a[0]||null,all:a,words:usable};
+            if(!a.length)a.push(...fallbackCandidates(data.text));a.sort((x,y)=>y.score-x.score);return a[0]||null;
           }
 
-          const worker=await createWorker('eng',1,{logger:m=>{if(m.status==='recognizing text'&&m.progress===1)process.stdout.write('.')}});
+          const worker=await createWorker('eng',1);
           await worker.setParameters({tessedit_char_whitelist:'0123456789,.',tessedit_pageseg_mode:'7',preserve_interword_spaces:'1'});
-          let pass=0;
-          const rows=[];
-          let i=0;
+          let pass=0,i=0;const rows=[];
           for(const t of tests){
             i++;
             const meta=await sharp(local[t.src]).metadata();
             const [rx,ry,rw,rh]=t.r;
             const left=Math.max(0,Math.floor(meta.width*rx)),top=Math.max(0,Math.floor(meta.height*ry));
             const width=Math.min(meta.width-left,Math.floor(meta.width*rw)),height=Math.min(meta.height-top,Math.floor(meta.height*rh));
-            const out=`/tmp/ocrimgs/crop-${String(i).padStart(2,'0')}.png`;
+            const out=`/tmp/ocrimgs/crop-${i}.png`;
             await sharp(local[t.src]).extract({left,top,width,height}).resize({width:800,fit:'inside',withoutEnlargement:false}).grayscale().linear(1.7,-89.6).png().toFile(out);
             const m=await sharp(out).metadata();
             const r=await worker.recognize(out,{}, {text:true,blocks:true});
-            const chosen=chooseCandidate(r.data,m.width,m.height,45).best;
-            const got=chosen?.n ?? null;
-            const ok=got!==null && Math.abs(got-t.expected)<0.011;
-            if(ok)pass++;
+            const chosen=chooseCandidate(r.data,m.width,m.height,45);
+            const got=chosen?.n??null,ok=got!==null&&Math.abs(got-t.expected)<.011;if(ok)pass++;
             rows.push({name:t.name,expected:t.expected,got,ok,kind:chosen?.kind||null,raw:(r.data.text||'').trim().replace(/\s+/g,' ')});
-            console.log(`\n${ok?'PASS':'FAIL'} ${i}. ${t.name}: expected=${t.expected.toFixed(2)} got=${got===null?'NONE':got.toFixed(2)} kind=${chosen?.kind||'-'} raw=${JSON.stringify(rows.at(-1).raw)}`);
           }
           await worker.terminate();
-          console.log(`\nSUMMARY ${pass}/${tests.length} PASS`);
-          console.log('RESULT_JSON '+JSON.stringify({pass,total:tests.length,rows}));
+          await fs.writeFile('ocr-test-report.json',JSON.stringify({pass,total:tests.length,rows},null,2));
+          let md=`# OCR Czech label test\n\n**Wynik: ${pass}/${tests.length} poprawnych**\n\n| # | Etykieta | Oczekiwano | OCR | Tryb | Wynik | Surowy OCR |\n|---:|---|---:|---:|---|:---:|---|\n`;
+          rows.forEach((r,idx)=>{md+=`| ${idx+1} | ${r.name} | ${r.expected.toFixed(2)} | ${r.got===null?'—':r.got.toFixed(2)} | ${r.kind||'—'} | ${r.ok?'✅':'❌'} | ${String(r.raw).replace(/\|/g,'/')} |\n`});
+          await fs.writeFile('ocr-test-report.md',md);
+          console.log(md);
           if(pass<tests.length) process.exitCode=1;
           JS
           node /tmp/ocr-test.mjs
+
+      - name: Commit OCR report
+        if: always()
+        shell: bash
+        run: |
+          if [ -f ocr-test-report.md ]; then
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add ocr-test-report.md ocr-test-report.json
+            git diff --cached --quiet || git commit -m "Update OCR test report"
+            git push
+          fi
+
+      - name: Fail workflow if OCR tests failed
+        if: steps.ocr.outcome == 'failure'
+        run: exit 1
