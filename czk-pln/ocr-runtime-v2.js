@@ -110,9 +110,13 @@
   }
 
   function parseWhole(data){
-    const raw=onlyDigits(data?.text||''),cand=[];
-    if(/^\d{1,4}$/.test(raw))cand.push({n:Number(raw),confidence:55,raw});
-    for(const x of words(data)){const d=onlyDigits(x.text),conf=Number(x.confidence??0);if(/^\d{1,4}$/.test(d))cand.push({n:Number(d),confidence:conf,raw:x.text})}
+    const cand=[],rawText=clean(data?.text||'').trim();
+    if(/^\d{1,4}$/.test(rawText))cand.push({n:Number(rawText),confidence:55,raw:rawText});
+    for(const x of words(data)){
+      const t=clean(x.text).trim(),conf=Number(x.confidence??0);
+      if(x._smartSplit||x._runtimeLeftFallback||/[.,-]/.test(t))continue;
+      if(/^\d{1,4}$/.test(t))cand.push({n:Number(t),confidence:conf,raw:t});
+    }
     return cand.filter(x=>x.n>=0&&x.n<10000).sort((a,b)=>b.confidence-a.confidence)[0]||null;
   }
 
