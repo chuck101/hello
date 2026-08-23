@@ -150,6 +150,8 @@
     worker.setParameters=async p=>{current={...current,...(p||{})};return baseSet(p)};
     worker.recognize=async(...rargs)=>{
       const before={...current},result=await baseRecognize(...rargs);if(!result?.data)return result;
+      // Never block the live camera with the expensive 4-pass left-side recovery.
+      if(!document.body.classList.contains('ocrTest'))return result;
       const image=rargs[0];if(!(image instanceof HTMLCanvasElement)||structuredAlready(result.data))return result;
       const cents=centsCandidates(result.data)[0];if(!cents)return result;const crop=makeLeftCrop(image,cents);if(!crop)return result;
       try{const left=await readWholeLeft(worker,baseRecognize,crop,before);if(left.hit!==null&&left.hit>=0&&left.hit<10000)addSynthetic(result.data,left.hit,cents.cents,cents.bbox,crop,{centsSource:cents.source,attempts:left.attempts,best:left.best||null})}
