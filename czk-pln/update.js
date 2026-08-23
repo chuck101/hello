@@ -1,6 +1,11 @@
 (()=>{
   'use strict';
 
+  const runtimePatch=document.createElement('script');
+  runtimePatch.src=`./ocr-runtime-v2.js?v=${encodeURIComponent(window.APP_VERSION||'dev')}`;
+  runtimePatch.async=false;
+  document.head.appendChild(runtimePatch);
+
   const installedVersion = window.APP_VERSION || 'nieznana';
   const versionEl = document.getElementById('appVersion');
   const statusEl = document.getElementById('updateStatus');
@@ -62,8 +67,6 @@
 
     setState('Pobieram…', true, `Pobieranie wersji ${latestVersion}…`);
 
-    // Wersja w URL skryptu wymusza na przeglądarce pobranie nowego pliku SW,
-    // zamiast polegać wyłącznie na heurystyce aktualizacji poprzedniej rejestracji.
     const registration = await navigator.serviceWorker.register(
       `./sw.js?v=${encodeURIComponent(latestVersion)}`,
       { scope: './', updateViaCache: 'none' }
@@ -77,7 +80,6 @@
 
     setState('Gotowe ✓', true, `Zainstalowano ${latestVersion}. Uruchamiam…`);
 
-    // Parametr wersji zapobiega odtworzeniu starej nawigacji z HTTP/cache przeglądarki.
     setTimeout(() => {
       reloading = true;
       location.replace(`./?app=${encodeURIComponent(latestVersion)}`);
@@ -108,8 +110,6 @@
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.addEventListener('controllerchange', () => {
       if (reloading) return;
-      // Nie przeładowujemy natychmiast w trakcie instalacji; installLatest zrobi to
-      // dopiero po potwierdzeniu aktywacji i z parametrem wersji.
     });
   }
 
