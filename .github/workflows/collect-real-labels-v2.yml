@@ -1,4 +1,4 @@
-# v4: collect only real Czech supermarket crops that visibly contain one price
+# v5: only printed Czech supermarket shelf-label crops
 name: Collect 20 real Czech price labels v2
 
 on:
@@ -15,10 +15,9 @@ permissions:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -28,32 +27,41 @@ jobs:
           sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-ces
           python3 -m pip install --quiet pillow
 
-      - name: Build 20 validated real shelf-label crops
+      - name: Build 20 printed supermarket shelf-label crops
         shell: bash
         run: |
           set -euo pipefail
           python3 <<'PY'
-          import html, json, math, re, shutil, subprocess, time, urllib.parse, urllib.request, urllib.error
+          import html, json, re, shutil, statistics, subprocess, time, urllib.parse, urllib.request, urllib.error
           from pathlib import Path
-          from PIL import Image, ImageOps, ImageEnhance
+          from PIL import Image, ImageOps, ImageEnhance, ImageStat
 
           API='https://commons.wikimedia.org/w/api.php'
-          UA='czk-pln-real-label-fixtures/4.0 (+https://github.com/chuck101/hello)'
+          UA='czk-pln-printed-shelf-fixtures/5.0 (+https://github.com/chuck101/hello)'
           OUT=Path('czk-pln/real-labels')
-          TMP=Path('/tmp/czk-real-labels-v4')
+          TMP=Path('/tmp/czk-real-labels-v5')
+          STAGE=TMP/'stage'
           TARGET=20
 
-          # Only real Czech retail/supermarket sources. No menus, museum boards or generic pricelists.
+          KNOWN_FILES=[
+              'File:LIDL prodejna - koutek pekárna.jpg',
+              'File:Výrobky firmy SENS s cvrččí moukou v Penny.jpg',
+              'File:Akční mléko Penny.jpg',
+              'File:2022-08-09 Tesco Extra Skalka 15.jpg',
+          ]
           SOURCE_CATEGORIES=[
               'Category:Price tags in the Czech Republic',
               'Category:Interiors of Tesco Skalka',
               'Category:Interiors of supermarkets in Prague',
               'Category:Penny Market supermarkets in Prague',
+              'Category:Lidl supermarkets in Czech Republic',
           ]
 
-          PRICE_HINTS=('kč','kc','czk','clubcard','cena','sleva','akce','akční','penny','tesco','lidl','billa','albert','kaufland')
+          RETAIL=('supermarket','tesco','lidl','penny','billa','albert','kaufland','price tag','clubcard','akční','akcni')
+          REJECT=('menu','food menu','jídelní','jidelni','ceník','cenik','pricelist','restaurant','restaurace','hotel','wc','toalet','zoo','museum','muze','vstup','entry price','parking','parkovi','jízdní','jizdni','fingerpost','blackboard','chalk','handwritten','ručně','rucne','občerstven','obcerstven')
           DEC_RE=re.compile(r'(?<!\d)(\d{1,4})\s*[,.]\s*(\d{2})(?!\d)')
-          SPLIT_RE=re.compile(r'(?<!\d)(\d{1,4})\s+(\d{2})(?!\d)')
+          DASH_RE=re.compile(r'(?<!\d)(\d{1,4})\s*[,.]?\s*[-–—](?!\d)')
+          LETTER_RE=re.compile(r'[A-Za-zÁ-ž]{2,}')
 
           def open_retry(url, timeout=60, max_bytes=None, attempts=6):
               last=None
@@ -68,239 +76,201 @@ jobs:
                       last=e
                       if e.code!=429: raise
                       retry=e.headers.get('Retry-After') if e.headers else None
-                      try: delay=max(10,int(retry)) if retry else min(70,10*(2**attempt))
-                      except: delay=min(70,10*(2**attempt))
-                      print(f'HTTP 429 -> sleep {delay}s',flush=True)
-                      time.sleep(delay)
+                      try: delay=max(10,int(retry)) if retry else min(80,10*(2**attempt))
+                      except: delay=min(80,10*(2**attempt))
+                      print(f'HTTP 429 -> sleep {delay}s',flush=True);time.sleep(delay)
                   except Exception as e:
                       last=e
                       if attempt==attempts-1: raise
-                      delay=min(30,4*(attempt+1)); print('network retry',delay,e,flush=True); time.sleep(delay)
+                      delay=min(30,4*(attempt+1));print('network retry',delay,e,flush=True);time.sleep(delay)
               raise last or RuntimeError('request failed')
 
           def api(params):
-              q=dict(params); q.update(format='json',formatversion='2',maxlag='5')
+              q=dict(params);q.update(format='json',formatversion='2',maxlag='5')
               data=open_retry(API+'?'+urllib.parse.urlencode(q),timeout=45,attempts=6)
-              time.sleep(.7)
+              time.sleep(.65)
               return json.loads(data.decode('utf-8'))
 
-          def strip_html(s):
-              return re.sub(r'<[^>]+>',' ',html.unescape(str(s or ''))).strip()
+          def strip_html(s): return re.sub(r'<[^>]+>',' ',html.unescape(str(s or ''))).strip()
 
           def category_files(category):
-              out=[]; cont=None
+              out=[];cont=None
               while True:
                   p={'action':'query','list':'categorymembers','cmtitle':category,'cmtype':'file','cmlimit':'max'}
                   if cont:p['cmcontinue']=cont
                   j=api(p)
-                  for x in j.get('query',{}).get('categorymembers',[]): out.append((x.get('title',''),category))
+                  out += [(x.get('title',''),category) for x in j.get('query',{}).get('categorymembers',[])]
                   cont=j.get('continue',{}).get('cmcontinue')
                   if not cont:break
               return out
 
           def batch_info(pairs):
               parent={}
-              for title,cat in pairs: parent.setdefault(title,set()).add(cat)
-              titles=list(parent); out=[]
+              for title,cat in pairs:parent.setdefault(title,set()).add(cat)
+              titles=list(parent);out=[]
               for start in range(0,len(titles),25):
-                  chunk=titles[start:start+25]
-                  j=api({'action':'query','titles':'|'.join(chunk),'prop':'imageinfo|categories','iiprop':'url|mime|extmetadata','iiurlwidth':'1600','cllimit':'max'})
+                  j=api({'action':'query','titles':'|'.join(titles[start:start+25]),'prop':'imageinfo|categories','iiprop':'url|mime|extmetadata','iiurlwidth':'1900','cllimit':'max'})
                   for p in j.get('query',{}).get('pages',[]):
-                      title=p.get('title',''); ii=(p.get('imageinfo') or [{}])[0]
+                      title=p.get('title','');ii=(p.get('imageinfo') or [{}])[0]
                       if ii.get('mime') not in ('image/jpeg','image/png','image/webp'):continue
                       ext=ii.get('extmetadata') or {}
                       def mv(k):
                           v=ext.get(k,{})
                           if isinstance(v,dict):v=v.get('value','')
                           return strip_html(v)
-                      out.append({
-                          'title':title,
-                          'parents':sorted(parent.get(title,set())),
-                          'thumb':ii.get('thumburl') or ii.get('url'),
-                          'original':ii.get('url'),
-                          'source_page':'https://commons.wikimedia.org/wiki/'+urllib.parse.quote(title.replace(' ','_'),safe=':/_()'),
-                          'author':mv('Artist'),'license':mv('LicenseShortName'),'license_url':mv('LicenseUrl'),
-                          'description':mv('ImageDescription'),
-                          'categories':[c.get('title','') for c in p.get('categories',[])],
-                      })
+                      out.append({'title':title,'parents':sorted(parent.get(title,set())),'thumb':ii.get('thumburl') or ii.get('url'),'original':ii.get('url'),'source_page':'https://commons.wikimedia.org/wiki/'+urllib.parse.quote(title.replace(' ','_'),safe=':/_()'),'author':mv('Artist'),'license':mv('LicenseShortName'),'license_url':mv('LicenseUrl'),'description':mv('ImageDescription'),'categories':[c.get('title','') for c in p.get('categories',[])]})
               return out
 
+          def source_blob(info): return ' '.join([info['title'],info['description'],*info['parents'],*info['categories']]).lower()
+          def source_ok(info):
+              b=source_blob(info)
+              if any(x in b for x in REJECT):return False
+              return any(x in b for x in RETAIL) or info['title'] in KNOWN_FILES
           def rank(info):
-              blob=' '.join([info['title'],info['description'],*info['parents'],*info['categories']]).lower()
-              score=0
-              for k in ('price tag','clubcard','akční','penny','tesco','supermarket','lidl','cena'): score += 8 if k in blob else 0
-              if 'price tags in the czech republic' in blob:score+=20
-              if 'tesco extra skalka' in blob:score+=8
+              b=source_blob(info);score=0
+              if info['title'] in KNOWN_FILES:score+=100
+              for x in ('price tag','tesco','lidl','penny','clubcard','supermarket','akční'):score+=12 if x in b else 0
+              if 'price tags in the czech republic' in b:score+=30
               return score
 
-          def download(url,path):
-              path.write_bytes(open_retry(url,timeout=70,max_bytes=14*1024*1024,attempts=6)); time.sleep(1.8)
-
+          def download(url,path):path.write_bytes(open_retry(url,timeout=70,max_bytes=16*1024*1024,attempts=6));time.sleep(1.4)
           def normalize(src,dst):
               with Image.open(src) as im:
-                  im=ImageOps.exif_transpose(im).convert('RGB'); im.thumbnail((1600,1600),Image.Resampling.LANCZOS)
-                  im.save(dst,'JPEG',quality=93,optimize=True)
+                  im=ImageOps.exif_transpose(im).convert('RGB');im.thumbnail((1900,1900),Image.Resampling.LANCZOS);im.save(dst,'JPEG',quality=94,optimize=True)
 
-          def tsv_image(path,psm=11):
-              p=subprocess.run(['tesseract',str(path),'stdout','-l','ces+eng','--psm',str(psm),'tsv'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=60)
-              lines=p.stdout.splitlines(); rows=[]
-              if not lines:return rows
+          def tsv(path,psm=11,lang='ces+eng'):
+              p=subprocess.run(['tesseract',str(path),'stdout','-l',lang,'--psm',str(psm),'tsv'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=60)
+              lines=p.stdout.splitlines();out=[]
+              if not lines:return out
               hdr=lines[0].split('\t')
               for line in lines[1:]:
                   cols=line.split('\t')
                   if len(cols)!=len(hdr):continue
-                  d=dict(zip(hdr,cols)); text=(d.get('text') or '').strip()
-                  if not text:continue
+                  d=dict(zip(hdr,cols));txt=(d.get('text') or '').strip()
+                  if not txt:continue
                   try:
                       for k in ('left','top','width','height'):d[k]=int(d[k])
                       d['conf']=float(d['conf'])
                   except:continue
-                  rows.append(d)
-              return rows
+                  out.append(d)
+              return out
 
           def numeric_rows(rows):
-              out=[]
-              for r in rows:
-                  if r['conf']<8 or not re.search(r'\d',r['text']):continue
-                  if r['width']<8 or r['height']<8:continue
-                  out.append(r)
-              out.sort(key=lambda r:r['width']*r['height'],reverse=True)
-              return out[:30]
+              out=[r for r in rows if r['conf']>=18 and re.search(r'\d',r['text']) and r['width']>=8 and r['height']>=9]
+              out.sort(key=lambda r:(r['width']*r['height'],r['conf']),reverse=True)
+              return out[:70]
 
           def make_crop(src,row,dst):
               with Image.open(src) as im:
-                  im=im.convert('RGB'); W,H=im.size
-                  rh=max(12,row['height']); rw=max(12,row['width'])
-                  ch=min(H,max(190,int(rh*5.2)))
-                  cw=min(W,max(500,int(ch*2.5),int(rw*3.0)))
-                  ch=min(H,max(1,int(cw/2.5)))
-                  cx=row['left']+rw/2; cy=row['top']+rh/2
-                  # keep more room to the right for small raised haler digits
-                  x0=int(cx-cw*.40); y0=int(cy-ch*.50)
-                  x0=max(0,min(W-cw,x0)); y0=max(0,min(H-ch,y0))
-                  crop=im.crop((x0,y0,x0+cw,y0+ch)).resize((1200,480),Image.Resampling.LANCZOS)
-                  crop.save(dst,'JPEG',quality=94,optimize=True)
-                  return (x0,y0,x0+cw,y0+ch)
+                  im=im.convert('RGB');W,H=im.size;rh=max(12,row['height']);rw=max(12,row['width'])
+                  ch=min(H,max(180,int(rh*6.3)));cw=min(W,max(520,int(ch*2.7),int(rw*3.4)));ch=min(H,max(1,int(cw/2.7)))
+                  cx=row['left']+rw/2;cy=row['top']+rh/2;x0=int(cx-cw*.43);y0=int(cy-ch*.50)
+                  x0=max(0,min(W-cw,x0));y0=max(0,min(H-ch,y0));box=(x0,y0,x0+cw,y0+ch)
+                  crop=im.crop(box).resize((1200,444),Image.Resampling.LANCZOS);crop.save(dst,'JPEG',quality=95,optimize=True);return box
 
-          def ocr_text(img_path,variant,psm):
-              with Image.open(img_path) as im:
+          def variant(src,dst,mode):
+              with Image.open(src) as im:
                   im=im.convert('L')
-                  if variant=='contrast': im=ImageEnhance.Contrast(im).enhance(2.0)
-                  elif variant=='threshold': im=im.point(lambda x:255 if x>165 else 0)
-                  tmp=TMP/f'ocr-{time.time_ns()}.png'; im.save(tmp)
+                  if mode=='contrast':im=ImageEnhance.Contrast(im).enhance(1.65)
+                  elif mode=='threshold':im=im.point(lambda x:255 if x>170 else 0)
+                  im.save(dst)
+
+          def ocr_pass(path,mode,psm):
+              tmp=TMP/f'v-{time.time_ns()}.png';variant(path,tmp,mode)
               try:
-                  p=subprocess.run(['tesseract',str(tmp),'stdout','-l','ces+eng','--psm',str(psm)],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=45)
-                  return re.sub(r'\s+',' ',p.stdout).strip()
+                  rows=tsv(tmp,psm);text=' '.join(r['text'] for r in rows);return re.sub(r'\s+',' ',text).strip(),rows
               finally:
                   try:tmp.unlink()
                   except:pass
 
-          def prices(text):
-              vals=[]
-              cleaned=str(text).replace('O','0').replace('o','0')
-              for a,b in DEC_RE.findall(cleaned):
+          def price_values(text):
+              s=str(text).replace('O','0').replace('o','0');vals=[]
+              for a,b in DEC_RE.findall(s):
                   v=int(a)+int(b)/100
                   if .05<v<10000:vals.append(round(v,2))
-              for a,b in SPLIT_RE.findall(cleaned):
-                  v=int(a)+int(b)/100
+              for a in DASH_RE.findall(s):
+                  v=float(a)
                   if .05<v<10000:vals.append(round(v,2))
               return list(dict.fromkeys(vals))
 
-          def validate_crop(path,direct_price_tag=False):
-              passes=[ocr_text(path,'raw',6),ocr_text(path,'contrast',11),ocr_text(path,'threshold',11)]
-              psets=[set(prices(t)) for t in passes]
+          def image_print_stats(path):
+              with Image.open(path) as im:
+                  g=im.convert('L').resize((600,222));hist=g.histogram();total=sum(hist);dark=sum(hist[:80])/total;light=sum(hist[190:])/total
+                  return dark,light
+
+          def printed_quality(rows,path):
+              good=[r for r in rows if r['conf']>=55 and len(re.sub(r'\W','',r['text'],flags=re.UNICODE))>=2]
+              letters=[r for r in good if LETTER_RE.search(r['text'])]
+              nums=[r for r in good if re.search(r'\d',r['text'])]
+              confs=[r['conf'] for r in good]
+              dark,light=image_print_stats(path)
+              ok=len(good)>=4 and len(letters)>=1 and len(nums)>=1 and statistics.median(confs)>=65 and .006<=dark<=.45 and light>=.32
+              return ok,{'good_tokens':len(good),'letter_tokens':len(letters),'numeric_tokens':len(nums),'median_conf':round(statistics.median(confs),1) if confs else 0,'dark_ratio':round(dark,3),'light_ratio':round(light,3)}
+
+          def validate_crop(path):
+              passes=[];all_rows=[]
+              for mode,psm in [('raw',6),('contrast',11),('threshold',11)]:
+                  text,rows=ocr_pass(path,mode,psm);passes.append(text);all_rows.extend(rows)
               counts={}
-              for s in psets:
-                  for v in s:counts[v]=counts.get(v,0)+1
+              for text in passes:
+                  for v in set(price_values(text)):counts[v]=counts.get(v,0)+1
               consensus=[v for v,c in counts.items() if c>=2]
-              if len(consensus)!=1:return None,passes
-              v=consensus[0]
-              blob=' '.join(passes).lower()
-              has_hint=any(h in blob for h in PRICE_HINTS)
-              # Direct Czech price-tag source can pass without OCR'ing the word Kč,
-              # but general supermarket photos must contain an explicit price-context hint.
-              if not direct_price_tag and not has_hint:return None,passes
-              return v,passes
+              if len(consensus)!=1:return None,passes,{'reason':'no single 2-of-3 price consensus'}
+              ok,q=printed_quality(all_rows,path)
+              if not ok:return None,passes,{'reason':'not confidently printed shelf text',**q}
+              return consensus[0],passes,{'reason':'accepted printed label',**q,'votes':counts[consensus[0]]}
 
           def iou(a,b):
-              x0=max(a[0],b[0]);y0=max(a[1],b[1]);x1=min(a[2],b[2]);y1=min(a[3],b[3])
-              inter=max(0,x1-x0)*max(0,y1-y0)
+              x0=max(a[0],b[0]);y0=max(a[1],b[1]);x1=min(a[2],b[2]);y1=min(a[3],b[3]);inter=max(0,x1-x0)*max(0,y1-y0)
               if not inter:return 0
-              aa=(a[2]-a[0])*(a[3]-a[1]);bb=(b[2]-b[0])*(b[3]-b[1])
-              return inter/(aa+bb-inter)
+              aa=(a[2]-a[0])*(a[3]-a[1]);bb=(b[2]-b[0])*(b[3]-b[1]);return inter/(aa+bb-inter)
 
-          shutil.rmtree(TMP,ignore_errors=True);TMP.mkdir(parents=True)
+          shutil.rmtree(TMP,ignore_errors=True);TMP.mkdir(parents=True);STAGE.mkdir(parents=True)
+          pairs=[(x,'KNOWN') for x in KNOWN_FILES]
+          for cat in SOURCE_CATEGORIES:
+              try:
+                  got=category_files(cat);print(cat,'files=',len(got),flush=True);pairs.extend(got)
+              except Exception as e:print('CATEGORY WARN',cat,e,flush=True)
+          infos=[x for x in batch_info(pairs) if source_ok(x)];infos.sort(key=lambda x:(-rank(x),x['title']))
+          print('Retail candidate photos:',len(infos),flush=True)
+
+          accepted=[]
+          for si,info in enumerate(infos[:120],1):
+              if len(accepted)>=TARGET:break
+              try:
+                  raw=TMP/f'src-{si:03d}.bin';norm=TMP/f'src-{si:03d}.jpg';print('SOURCE',si,info['title'],flush=True)
+                  download(info['thumb'],raw);normalize(raw,norm);nums=numeric_rows(tsv(norm,11))
+                  used=[];per_source=0
+                  for ri,row in enumerate(nums):
+                      if len(accepted)>=TARGET or per_source>=8:break
+                      crop=TMP/f'crop-{si:03d}-{ri:02d}.jpg';box=make_crop(norm,row,crop)
+                      if any(iou(box,b)>.38 for b in used):continue
+                      expected,passes,quality=validate_crop(crop)
+                      if expected is None:
+                          print(' REJECT crop',ri,quality.get('reason'),quality,flush=True);continue
+                      fn=f'real-{len(accepted)+1:02d}.jpg';shutil.copyfile(crop,STAGE/fn);used.append(box);per_source+=1
+                      accepted.append({'name':f'{info["title"].removeprefix("File:")} — printed label {per_source}','file':'./real-labels/'+fn,'expected':expected,'expected_source':'2-of-3 OCR consensus on a crop independently classified as printed shelf text','reference_confidence':'automatic reference; visually reviewable','source_page':info['source_page'],'original_url':info['original'],'author':info['author'],'license':info['license'],'license_url':info['license_url'],'description':info['description'],'source_categories':info['parents'],'fixture_ocr_passes':passes,'printed_quality':quality})
+                      print(' ACCEPT',len(accepted),expected,quality,flush=True)
+              except Exception as e:print('WARN',info['title'],repr(e),flush=True);time.sleep(2)
+
+          if len(accepted)<TARGET:raise SystemExit(f'Only {len(accepted)}/{TARGET} genuinely printed supermarket label crops passed; old fixtures are left untouched')
+
+          manifest={'type':'real-czech-printed-supermarket-shelf-label-crops','count':20,'quality_rule':'Only crops from Czech supermarket/retail photographs. Menu/pricelist/WC/restaurant/handwritten-type sources are rejected before OCR. Each crop must contain at least four high-confidence printed OCR tokens, including letters and digits, median token confidence >=65, plausible printed-label image density, and exactly one price agreed by at least two of three OCR passes.','ground_truth_note':'Expected prices are automatic 2-of-3 OCR consensus references and remain visually reviewable.','labels':accepted}
+          (STAGE/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+          lines=['# 20 printed Czech supermarket shelf-label crops','','These are real crops of printed retail shelf labels; menus, generic pricelists, WC signs and handwritten examples are excluded.','','| # | File | Reference | Source |','|---:|---|---:|---|']
+          for i,x in enumerate(accepted,1):lines.append(f'| {i} | `real-{i:02d}.jpg` | {x["expected"]:.2f} Kč | [{x["name"].replace("|","/")}]({x["source_page"]}) |')
+          (STAGE/'SOURCES.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+
           OUT.mkdir(parents=True,exist_ok=True)
           for p in OUT.glob('real-*.jpg'):p.unlink()
           for n in ('manifest.json','SOURCES.md'):
               p=OUT/n
               if p.exists():p.unlink()
-
-          pairs=[]
-          for cat in SOURCE_CATEGORIES:
-              got=category_files(cat); print(cat,'files=',len(got),flush=True); pairs.extend(got)
-          infos=batch_info(pairs); infos.sort(key=lambda x:(-rank(x),x['title']))
-          print('Unique candidate photos:',len(infos),flush=True)
-
-          accepted=[]
-          for si,info in enumerate(infos[:70],1):
-              if len(accepted)>=TARGET:break
-              try:
-                  raw=TMP/f'src-{si:03d}.bin'; norm=TMP/f'src-{si:03d}.jpg'
-                  print('SOURCE',si,info['title'],flush=True)
-                  download(info['thumb'],raw);normalize(raw,norm)
-                  rows=tsv_image(norm,11); nums=numeric_rows(rows)
-                  if not nums:continue
-                  direct=any('Price tags in the Czech Republic' in x for x in info['parents']+info['categories'])
-                  used=[];per_source=0
-                  for ri,row in enumerate(nums):
-                      if len(accepted)>=TARGET or per_source>=4:break
-                      tmpcrop=TMP/f'crop-{si:03d}-{ri:02d}.jpg'
-                      box=make_crop(norm,row,tmpcrop)
-                      if any(iou(box,b)>.55 for b in used):continue
-                      expected,passes=validate_crop(tmpcrop,direct)
-                      if expected is None:continue
-                      fn=f'real-{len(accepted)+1:02d}.jpg';shutil.copyfile(tmpcrop,OUT/fn)
-                      used.append(box);per_source+=1
-                      accepted.append({
-                          'name':f'{info["title"].removeprefix("File:")} — crop {per_source}',
-                          'file':'./real-labels/'+fn,
-                          'expected':expected,
-                          'expected_source':'automatic 3-pass OCR consensus on high-resolution real crop',
-                          'reference_confidence':'2-of-3 or 3-of-3 OCR consensus; visually reviewable, not manual ground truth',
-                          'source_page':info['source_page'],'original_url':info['original'],
-                          'author':info['author'],'license':info['license'],'license_url':info['license_url'],
-                          'description':info['description'],'source_categories':info['parents'],
-                          'fixture_ocr_passes':passes,
-                      })
-                      print('ACCEPT',len(accepted),expected,info['title'],flush=True)
-              except Exception as e:
-                  print('WARN',info['title'],repr(e),flush=True);time.sleep(3)
-
-          if len(accepted)<TARGET:
-              raise SystemExit(f'Only {len(accepted)}/{TARGET} high-quality price crops passed strict validation')
-
-          manifest={
-              'type':'real-czech-supermarket-price-label-crops',
-              'count':len(accepted),
-              'quality_rule':'Every fixture is a crop from a real Czech retail/supermarket photograph. It is included only when three independent preprocessing passes produce exactly one price and at least two agree. General store photos also require price-context text such as Kč/cena/Clubcard.',
-              'ground_truth_note':'Expected prices are automatic OCR consensus references, not manually verified ground truth. They are suitable for regression triage and should be visually corrected if a reference is ever wrong.',
-              'labels':accepted,
-          }
-          (OUT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
-
-          lines=['# 20 validated real Czech supermarket price crops','',
-                 'Every JPG is cropped from a real Czech retail/supermarket photograph on Wikimedia Commons. Generic menus/pricelists are excluded.',
-                 'A crop is kept only when 2/3 OCR preprocessing passes agree on exactly one price. Expected values are therefore automatic references, not manual ground truth.','',
-                 '| # | File | Reference | Source | Author | Licence |','|---:|---|---:|---|---|---|']
-          for i,x in enumerate(accepted,1):
-              name=x['name'].replace('|','\\|');author=(x['author'] or '—').replace('|','\\|');lic=(x['license'] or '—').replace('|','\\|')
-              lines.append(f'| {i} | `real-{i:02d}.jpg` | {x["expected"]:.2f} Kč | [{name}]({x["source_page"]}) | {author} | {lic} |')
-          (OUT/'SOURCES.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
-          print('DONE: 20 validated real price crops',flush=True)
+          for p in STAGE.iterdir():shutil.copy2(p,OUT/p.name)
+          print('DONE: replaced fixtures with 20 printed shelf labels',flush=True)
           PY
 
-      - name: Commit fixtures to master
+      - name: Commit printed fixtures
         shell: bash
         run: |
           set -euo pipefail
@@ -310,7 +280,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes"
           else
-            git commit -m "Replace fixtures with validated real Czech shelf labels"
+            git commit -m "Replace test fixtures with printed Czech shelf labels"
             git push origin HEAD:master
           fi
 
