@@ -1,0 +1,98 @@
+name: Patch OCR test diagnostics
+
+on:
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/patch-test-ocr-diagnostics.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Patch test OCR passes and diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          p=Path('czk-pln/test-mode.js')
+          s=p.read_text(encoding='utf-8')
+
+          old="""  async function onePass(worker,source,name,mode,psm){
+    renderVariant(source,mode);try{await worker.setParameters({tessedit_pageseg_mode:String(psm),tessedit_char_whitelist:'0123456789,.-'})}catch{}
+    const r=await worker.recognize(api.canvas,{}, {text:true,blocks:true}),chosen=api.chooseCandidate(r.data),raw=String(r.data?.text||'').trim().replace(/\\s+/g,' ');
+    return{name,raw,chosen,rawPrices:rawPriceCandidates(raw)};
+  }
+"""
+          new="""  function tokenDump(data){
+    const out=[],seen=new Set();
+    const add=w=>{
+      if(!w||typeof w.text!=='string')return;
+      const t=w.text.trim();if(!t)return;
+      const b=w.bbox||{},conf=Math.round(Number(w.confidence??0));
+      const key=[t,b.x0,b.y0,b.x1,b.y1].join('|');if(seen.has(key))return;seen.add(key);
+      out.push(`${t}{c${conf};${Math.round(b.x0||0)},${Math.round(b.y0||0)}-${Math.round(b.x1||0)},${Math.round(b.y1||0)}}`);
+    };
+    if(Array.isArray(data?.words))data.words.forEach(add);
+    for(const bl of (data?.blocks||[]))for(const pa of (bl.paragraphs||[]))for(const li of (pa.lines||[]))for(const w of (li.words||[]))add(w);
+    return out.slice(0,40).join(' ');
+  }
+
+  async function onePass(worker,source,name,mode,psm){
+    renderVariant(source,mode);try{await worker.setParameters({tessedit_pageseg_mode:String(psm),tessedit_char_whitelist:'0123456789,.-'})}catch{}
+    const r=await worker.recognize(api.canvas,{}, {text:true,blocks:true}),chosen=api.chooseCandidate(r.data),raw=String(r.data?.text||'').trim().replace(/\\s+/g,' ');
+    return{name,raw,chosen,rawPrices:rawPriceCandidates(raw),tokens:tokenDump(r.data)};
+  }
+"""
+          if old not in s:
+              raise SystemExit('onePass block not found')
+          s=s.replace(old,new,1)
+
+          old="""  function diagnosticPasses(passes){return passes.map(p=>{const c=p.chosen?`${p.chosen.n} (${p.chosen.kind||'?'})`:'brak',special=p.rawPrices.length?' candidates='+p.rawPrices.map(x=>`${x.n}(${x.kind})`).join(','):'';return`${p.name}: ${c}${special}; raw=\"${p.raw||'—'}\"`}).join(' | ')}
+"""
+          new="""  function diagnosticPasses(passes){return passes.map(p=>{const c=p.chosen?`${p.chosen.n} (${p.chosen.kind||'?'})`:'brak',special=p.rawPrices.length?' candidates='+p.rawPrices.map(x=>`${x.n}(${x.kind})`).join(','):'';return`${p.name}: ${c}${special}; raw=\"${p.raw||'—'}\"; tokens=[${p.tokens||'—'}]`}).join(' | ')}
+"""
+          if old not in s:
+              raise SystemExit('diagnosticPasses block not found')
+          s=s.replace(old,new,1)
+
+          old="""      passes.push(await onePass(worker,source,'linia','soft',7));if(token!==recognizeToken||!active)return null;
+      passes.push(await onePass(worker,source,'sparse','normal',11));if(token!==recognizeToken||!active)return null;
+      passes.push(await onePass(worker,source,'binary','binary',7));if(token!==recognizeToken||!active)return null;
+"""
+          new="""      passes.push(await onePass(worker,source,'linia','soft',7));if(token!==recognizeToken||!active)return null;
+      passes.push(await onePass(worker,source,'word','normal',8));if(token!==recognizeToken||!active)return null;
+      passes.push(await onePass(worker,source,'sparse','normal',11));if(token!==recognizeToken||!active)return null;
+      passes.push(await onePass(worker,source,'binary','binary',7));if(token!==recognizeToken||!active)return null;
+"""
+          if old not in s:
+              raise SystemExit('passes block not found')
+          s=s.replace(old,new,1)
+
+          p.write_text(s,encoding='utf-8')
+          PY
+
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add czk-pln/test-mode.js
+          git diff --cached --quiet && exit 0
+          git commit -m "Improve real-label OCR diagnostics and add word pass"
+          git push origin HEAD:master
+
+      - name: Deploy Pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref master
