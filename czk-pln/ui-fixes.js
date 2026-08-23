@@ -23,10 +23,10 @@
     .manualKeys{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
     .manualKeys button{width:100%;height:54px;min-height:54px;padding:0;font-size:24px;border-radius:12px}
     .manualKeys .back{font-size:21px}
-    .manualClear{width:100%;height:46px;min-height:46px;margin-top:7px;border-radius:12px;font-size:15px}
-    .manualClose{width:100%;margin-top:7px;height:44px;min-height:44px;border-radius:12px;font-size:14px}
+    .manualBottomActions{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:7px}
+    .manualBottomActions button{width:100%;height:46px;min-height:46px;margin:0;border-radius:12px;font-size:15px}
     @media (max-height:700px){
-      .manualPadWrap{padding:10px}.manualDisplay{height:54px;font-size:31px}.manualResult{min-height:70px;margin:4px 2px 3px}.manualResultPln{font-size:42px}.manualRateItem{font-size:11px;padding:4px 5px}.manualIdle{margin-bottom:6px}.manualKeys button{height:47px;min-height:47px}.manualClear{height:42px;min-height:42px}.manualClose{height:40px;min-height:40px}
+      .manualPadWrap{padding:10px}.manualDisplay{height:54px;font-size:31px}.manualResult{min-height:70px;margin:4px 2px 3px}.manualResultPln{font-size:42px}.manualRateItem{font-size:11px;padding:4px 5px}.manualIdle{margin-bottom:6px}.manualKeys button{height:47px;min-height:47px}.manualBottomActions button{height:42px;min-height:42px}
     }
   `;
   document.head.appendChild(style);
@@ -75,8 +75,10 @@
         <button type="button" data-key="7">7</button><button type="button" data-key="8">8</button><button type="button" data-key="9">9</button>
         <button type="button" data-key=",">,</button><button type="button" data-key="0">0</button><button type="button" data-key="back" class="back">⌫</button>
       </div>
-      <button id="manualClear" class="manualClear" type="button">Wyczyść</button>
-      <button id="manualPadClose" class="manualClose" type="button">Zamknij</button>
+      <div class="manualBottomActions">
+        <button id="manualClear" type="button">Wyczyść</button>
+        <button id="manualPadClose" type="button">Zamknij</button>
+      </div>
     </div>`;
 
   const display=document.getElementById('manualValuePad');
