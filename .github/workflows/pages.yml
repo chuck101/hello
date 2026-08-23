@@ -28,7 +28,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          VERSION="$(date -u +'%Y.%m.%d.%H%M')-${GITHUB_SHA::7}"
+          VERSION="$(TZ=Europe/Warsaw date +'%Y.%m.%d.%H%M')-${GITHUB_SHA::7}"
           HIDDEN_PATH="r/6b9c4f2a8e17d3c5f9410a7e2d8b64c1"
 
           mkdir -p czk-pln/ocr/core czk-pln/ocr/lang czk-pln/test-labels
