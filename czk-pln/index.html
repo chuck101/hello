@@ -24,7 +24,7 @@
   <label for="contrast">Kontrast obrazu</label><div class="rangeRow"><input id="contrast" type="range" min="10" max="26" step="1"><span id="contrastVal" class="rangeVal"></span></div>
   <label for="confidence">Minimalna pewność OCR</label><div class="rangeRow"><input id="confidence" type="range" min="20" max="90" step="5"><span id="confidenceVal" class="rangeVal"></span></div>
   <label for="stability">Ile razy cena musi się powtórzyć</label><div class="rangeRow"><input id="stability" type="range" min="1" max="4" step="1"><span id="stabilityVal" class="rangeVal"></span></div>
-  <p class="settingNote">Mniejsze pole + większa pewność = mniej przypadkowych liczb. OCR rozpoznaje zarówno 74,90, jak i układ 74 + mniejsze 90 obok.</p>
+  <p class="settingNote">Mniejsze pole + większa pewność = mniej przypadkowych liczb. OCR rozpoznaje 74,90, układ 74 + mniejsze 90 oraz czeskie ceny całkowite typu 8.-.</p>
   <button id="resetScan" class="resetBtn" type="button">Przywróć ustawienia skanowania</button>
 
   <h3>Kurs CZK → PLN</h3>
@@ -41,7 +41,7 @@
 (()=>{'use strict';
 const $=x=>document.getElementById(x),video=$('video'),canvas=$('canvas'),ctx=canvas.getContext('2d',{willReadFrequently:true}),pln=$('pln'),czk=$('czk'),rateEl=$('rate'),status=$('status'),scanBox=$('scanBox');
 let stream=null,worker=null,running=false,busy=false,timer=null,last=null,hits=0,rate100=Number(localStorage.getItem('czkRate100'))||0,source=localStorage.getItem('czkRateSource')||'auto';
-const defaults={scanWidth:55,scanHeight:18,contrast:17,confidence:45,stability:2};
+const defaults={scanWidth:55,scanHeight:18,contrast:17,confidence:45,stability:1};
 const cfg={};
 for(const k of Object.keys(defaults)){const v=Number(localStorage.getItem('scan_'+k));cfg[k]=Number.isFinite(v)&&v>0?v:defaults[k]}
 const fmt=(n,d=2)=>new Intl.NumberFormat('pl-PL',{minimumFractionDigits:d,maximumFractionDigits:d}).format(n);
@@ -53,10 +53,10 @@ function applyBox(){const w=cfg.scanWidth,h=cfg.scanHeight,centerY=44;scanBox.st
 function syncSettings(){for(const k of Object.keys(defaults))$(k).value=cfg[k];$('scanWidthVal').textContent=cfg.scanWidth+'%';$('scanHeightVal').textContent=cfg.scanHeight+'%';$('contrastVal').textContent=(cfg.contrast/10).toFixed(1)+'×';$('confidenceVal').textContent=cfg.confidence+'%';$('stabilityVal').textContent=String(cfg.stability);applyBox()}
 function saveCfg(k,v){cfg[k]=Number(v);localStorage.setItem('scan_'+k,String(cfg[k]));syncSettings();hits=0}
 function flattenWords(data){const out=[];const seen=new Set();const add=w=>{if(!w||typeof w.text!=='string'||!w.bbox)return;const b=w.bbox,key=[w.text,b.x0,b.y0,b.x1,b.y1].join('|');if(seen.has(key))return;seen.add(key);out.push(w)};if(Array.isArray(data.words))data.words.forEach(add);for(const b of (data.blocks||[]))for(const p of (b.paragraphs||[]))for(const l of (p.lines||[]))for(const w of (l.words||[]))add(w);return out}
-function cleanText(t){return String(t||'').replace(/[Oo]/g,'0').replace(/[Il|]/g,'1').replace(/\s/g,'')}
+function cleanText(t){return String(t||'').replace(/[Oo]/g,'0').replace(/[Il|]/g,'1').replace(/[–—−]/g,'-').replace(/\s/g,'')}
 function boxInfo(w){const b=w.bbox,h=Math.max(1,b.y1-b.y0),wid=Math.max(1,b.x1-b.x0);return{b,h,wid,cx:(b.x0+b.x1)/2,cy:(b.y0+b.y1)/2}}
 function candidateScore(n,b,conf,bonus=0){const cx=canvas.width/2,cy=canvas.height/2,diag=Math.hypot(cx,cy)||1,mx=(b.x0+b.x1)/2,my=(b.y0+b.y1)/2,dist=Math.hypot(mx-cx,my-cy)/diag,area=Math.max(1,(b.x1-b.x0)*(b.y1-b.y0))/(canvas.width*canvas.height);return{n,score:(1-dist)*7+Math.min(area*35,2.5)+(conf/100)*2+bonus,confidence:conf,dist}}
-function fallbackCandidates(text){text=cleanText(text);let m=text.match(/\d{1,5}[.,]\d{2}/g)||[],a=[];for(let s of m){let n=num(s);if(n>.05&&n<100000)a.push({n,score:4,confidence:0,text:s})}return a}
+function fallbackCandidates(text){text=cleanText(text);const a=[];for(const s of (text.match(/\d{1,5}[.,]\d{2}/g)||[])){const n=num(s);if(n>.05&&n<100000)a.push({n,score:4,confidence:0,text:s,kind:'decimal'})}for(const m of text.matchAll(/(?:^|[^0-9])(\d{1,5})(?:[.,])?-(?:[^0-9]|$)/g)){const n=Number(m[1]);if(n>.05&&n<100000)a.push({n,score:4.5,confidence:0,text:m[0],kind:'whole-dash'})}return a}
 function chooseCandidate(data){
   const words=flattenWords(data),a=[];
   const usable=[];
@@ -66,6 +66,8 @@ function chooseCandidate(data){
     usable.push({w,t,conf,...bi});
     const full=t.match(/(?:^|[^0-9])(\d{1,5}[.,]\d{2})(?:[^0-9]|$)/);
     if(full){const n=num(full[1]);if(n>.05&&n<100000){const c=candidateScore(n,bi.b,conf,3.2);c.text=full[1];c.kind='decimal';a.push(c)}}
+    const dash=t.match(/(?:^|[^0-9])(\d{1,5})(?:[.,])?-(?:[^0-9]|$)/);
+    if(dash){const n=Number(dash[1]);if(n>.05&&n<100000){const c=candidateScore(n,bi.b,conf,4);c.text=dash[0];c.kind='whole-dash';a.push(c)}}
   }
   for(const main of usable){
     if(!/^\d{1,5}$/.test(main.t)||main.conf<cfg.confidence)continue;
@@ -87,10 +89,10 @@ function chooseCandidate(data){
   for(const w of usable){if(!/^\d{1,5}$/.test(w.t)||w.conf<cfg.confidence)continue;const n=Number(w.t);if(!(n>.05&&n<100000))continue;const c=candidateScore(n,w.b,w.conf,0);c.text=w.t;c.kind='whole';a.push(c)}
   if(!a.length)a.push(...fallbackCandidates(data.text));a.sort((x,y)=>y.score-x.score);return a[0]||null;
 }
-function crop(){if(!video.videoWidth)return false;let vw=video.videoWidth,vh=video.videoHeight,sw=vw*(cfg.scanWidth/100),sh=vh*(cfg.scanHeight/100),sx=(vw-sw)/2,sy=vh*.44-sh/2,tw=Math.min(900,Math.max(420,Math.round(sw))),th=Math.max(100,Math.round(sh*tw/sw));canvas.width=tw;canvas.height=th;ctx.drawImage(video,sx,sy,sw,sh,0,0,tw,th);let im=ctx.getImageData(0,0,tw,th),d=im.data,mul=cfg.contrast/10;for(let i=0;i<d.length;i+=4){let y=.299*d[i]+.587*d[i+1]+.114*d[i+2],c=Math.max(0,Math.min(255,(y-128)*mul+128));d[i]=d[i+1]=d[i+2]=c}ctx.putImageData(im,0,0);return true}
-async function getWorker(){if(worker)return worker;status.textContent='Ładowanie OCR…';worker=await Tesseract.createWorker('eng',1,{logger:m=>{if(m.status==='recognizing text')status.textContent=`OCR ${Math.round((m.progress||0)*100)}%`}});await worker.setParameters({tessedit_char_whitelist:'0123456789,.',tessedit_pageseg_mode:'7',preserve_interword_spaces:'1'});return worker}
-async function scan(){if(!running||busy)return;if(!rate100){status.textContent='Brak kursu';timer=setTimeout(scan,800);return}if(!crop()){timer=setTimeout(scan,500);return}busy=true;try{let w=await getWorker(),r=await w.recognize(canvas,{}, {text:true,blocks:true}),c=chooseCandidate(r.data);if(c){let v=c.n;if(last!==null&&Math.abs(v-last)<.011)hits++;else{last=v;hits=1}if(hits>=cfg.stability)show(v);status.textContent=hits>=cfg.stability?`Rozpoznano ${fmt(v)} Kč`:`Sprawdzam ${fmt(v)} Kč ${hits}/${cfg.stability}`}else{hits=0;status.textContent='Nie widzę ceny w środku ramki'}}catch(e){console.error(e);status.textContent='Błąd OCR'}finally{busy=false;if(running)timer=setTimeout(scan,500)}}
-async function start(){try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},audio:false});video.srcObject=stream;await video.play();running=true;$('camera').textContent='Stop';status.textContent='Aparat działa';timer=setTimeout(scan,250)}catch(e){alert('Nadaj stronie dostęp do aparatu i otwórz ją przez HTTPS.')}}
+function crop(){if(!video.videoWidth)return false;let vw=video.videoWidth,vh=video.videoHeight,sw=vw*(cfg.scanWidth/100),sh=vh*(cfg.scanHeight/100),sx=(vw-sw)/2,sy=vh*.44-sh/2,tw=Math.min(720,Math.max(380,Math.round(sw))),th=Math.max(100,Math.round(sh*tw/sw));canvas.width=tw;canvas.height=th;ctx.drawImage(video,sx,sy,sw,sh,0,0,tw,th);let im=ctx.getImageData(0,0,tw,th),d=im.data,mul=cfg.contrast/10;for(let i=0;i<d.length;i+=4){let y=.299*d[i]+.587*d[i+1]+.114*d[i+2],c=Math.max(0,Math.min(255,(y-128)*mul+128));d[i]=d[i+1]=d[i+2]=c}ctx.putImageData(im,0,0);return true}
+async function getWorker(){if(worker)return worker;status.textContent='Ładowanie OCR…';worker=await Tesseract.createWorker('eng',1,{logger:m=>{if(m.status==='recognizing text')status.textContent=`OCR ${Math.round((m.progress||0)*100)}%`}});await worker.setParameters({tessedit_char_whitelist:'0123456789,.-',tessedit_pageseg_mode:'7',preserve_interword_spaces:'1'});return worker}
+async function scan(){if(!running||busy)return;if(!rate100){status.textContent='Brak kursu';timer=setTimeout(scan,800);return}if(!crop()){timer=setTimeout(scan,250);return}busy=true;try{const w=await getWorker(),r=await w.recognize(canvas,{}, {text:true,blocks:true}),c=chooseCandidate(r.data);if(c){const v=c.n;if(last!==null&&Math.abs(v-last)<.011)hits++;else{last=v;hits=1}if(hits>=cfg.stability)show(v);status.textContent=hits>=cfg.stability?`Rozpoznano ${fmt(v)} Kč`:`Sprawdzam ${fmt(v)} Kč ${hits}/${cfg.stability}`}else{hits=0;status.textContent='Nie widzę ceny w środku ramki'}}catch(e){console.error(e);status.textContent='Błąd OCR'}finally{busy=false;if(running)timer=setTimeout(scan,120)}}
+async function start(){try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},audio:false});video.srcObject=stream;await video.play();running=true;$('camera').textContent='Stop';status.textContent='Aparat działa';timer=setTimeout(scan,80)}catch(e){alert('Nadaj stronie dostęp do aparatu i otwórz ją przez HTTPS.')}}
 function stop(){running=false;clearTimeout(timer);stream?.getTracks().forEach(t=>t.stop());stream=null;video.srcObject=null;$('camera').textContent='Start aparatu';status.textContent='Aparat wyłączony'}
 window.PriceScannerTestAPI={canvas,ctx,cfg,chooseCandidate,getWorker,stop};
 $('camera').onclick=()=>running?stop():start();
