@@ -9,9 +9,10 @@
     #manualDlg{overflow:hidden;width:min(92vw,390px)}
     .manualPadWrap{padding:14px}
     .manualDisplay{width:100%;height:62px;border:1px solid #3d424c;border-radius:14px;background:#08090c;color:#fff;padding:8px 13px;font-size:36px;font-weight:850;text-align:right;font-variant-numeric:tabular-nums;caret-color:transparent}
-    .manualResult{min-height:76px;margin:7px 2px 5px;text-align:right;display:flex;flex-direction:column;justify-content:center;line-height:1.05}
+    .manualResult{min-height:82px;margin:7px 2px 5px;text-align:right;display:flex;flex-direction:column;justify-content:center;line-height:1.05}
     .manualResultHint{font-size:13px;font-weight:700;color:#aeb6c2;min-height:17px}
-    .manualResultCzk{font-size:16px;font-weight:750;color:#b9bec7;margin-bottom:2px}
+    .manualRateRow{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:5px}
+    .manualRateItem{background:#ffffff0b;border:1px solid #ffffff14;border-radius:9px;padding:5px 7px;font-size:12px;font-weight:750;color:#b9bec7;text-align:center;white-space:nowrap;font-variant-numeric:tabular-nums}
     .manualResultPln{font-size:48px;font-weight:900;letter-spacing:-.04em;color:#fff;white-space:nowrap}
     .manualIdle{height:20px;margin:0 2px 8px;position:relative}
     .manualIdleText{font-size:11px;color:#aeb6c2;text-align:right;line-height:14px;min-height:14px;transition:opacity .18s,transform .18s}
@@ -25,7 +26,7 @@
     .manualClear{width:100%;height:46px;min-height:46px;margin-top:7px;border-radius:12px;font-size:15px}
     .manualClose{width:100%;margin-top:7px;height:44px;min-height:44px;border-radius:12px;font-size:14px}
     @media (max-height:700px){
-      .manualPadWrap{padding:10px}.manualDisplay{height:54px;font-size:31px}.manualResult{min-height:64px;margin:4px 2px 3px}.manualResultPln{font-size:42px}.manualIdle{margin-bottom:6px}.manualKeys button{height:47px;min-height:47px}.manualClear{height:42px;min-height:42px}.manualClose{height:40px;min-height:40px}
+      .manualPadWrap{padding:10px}.manualDisplay{height:54px;font-size:31px}.manualResult{min-height:70px;margin:4px 2px 3px}.manualResultPln{font-size:42px}.manualRateItem{font-size:11px;padding:4px 5px}.manualIdle{margin-bottom:6px}.manualKeys button{height:47px;min-height:47px}.manualClear{height:42px;min-height:42px}.manualClose{height:40px;min-height:40px}
     }
   `;
   document.head.appendChild(style);
@@ -90,6 +91,7 @@
   let buffer='',replaceOnNext=false,lastInputAt=0,idleTimer=0;
 
   const fmt=n=>new Intl.NumberFormat('pl-PL',{minimumFractionDigits:2,maximumFractionDigits:2}).format(n);
+  const fmtRate=n=>new Intl.NumberFormat('pl-PL',{minimumFractionDigits:2,maximumFractionDigits:4}).format(n);
   const render=()=>{display.value=buffer};
   const hint=text=>{result.innerHTML=`<span class="manualResultHint">${text}</span>`};
 
@@ -127,11 +129,13 @@
     document.getElementById('czk').textContent=`${fmt(n)} Kč`;
     if(rate100>0){
       const pln=n*rate100/100;
+      const oneCzk=rate100/100;
+      const onePln=100/rate100;
       document.getElementById('pln').textContent=`${fmt(pln)} zł`;
-      result.innerHTML=`<span class="manualResultCzk">${fmt(n)} Kč</span><span class="manualResultPln">${fmt(pln)} zł</span>`;
+      result.innerHTML=`<span class="manualRateRow"><span class="manualRateItem">1 Kč = ${fmtRate(oneCzk)} zł</span><span class="manualRateItem">1 zł = ${fmtRate(onePln)} Kč</span></span><span class="manualResultPln">${fmt(pln)} zł</span>`;
     }else{
       document.getElementById('pln').textContent='— zł';
-      result.innerHTML=`<span class="manualResultCzk">${fmt(n)} Kč</span><span class="manualResultHint">Brak kursu</span>`;
+      result.innerHTML=`<span class="manualResultHint">Brak kursu</span>`;
     }
   }
 
