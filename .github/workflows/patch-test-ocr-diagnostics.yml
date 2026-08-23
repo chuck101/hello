@@ -1,11 +1,10 @@
-# trigger: fast live OCR + Warsaw version time
-name: Patch OCR speed and version time
+name: Apply OCR speed patch
 
 on:
   push:
     branches: ["master"]
     paths:
-      - ".github/workflows/patch-test-ocr-diagnostics.yml"
+      - "czk-pln/speed-trigger.txt"
   workflow_dispatch:
 
 permissions:
@@ -20,32 +19,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Patch live OCR, test fast-path and Warsaw version time
+      - name: Apply fast live OCR changes
         shell: bash
         run: |
           set -euo pipefail
           python3 <<'PY'
           from pathlib import Path
 
-          def replace_once(s, old, new, name):
-              if old in s:
-                  return s.replace(old, new, 1), True
-              if new in s:
-                  print('already patched:', name)
-                  return s, False
-              raise SystemExit('pattern not found: '+name)
-
-          # 1) Version timestamp in Europe/Warsaw, not UTC.
-          p=Path('.github/workflows/pages.yml')
-          s=p.read_text(encoding='utf-8')
-          s, _ = replace_once(
-              s,
-              'VERSION="$(date -u +\'%Y.%m.%d.%H%M\')-${GITHUB_SHA::7}"',
-              'VERSION="$(TZ=Europe/Warsaw date +\'%Y.%m.%d.%H%M\')-${GITHUB_SHA::7}"',
-              'Warsaw version timestamp')
-          p.write_text(s, encoding='utf-8')
-
-          # 2) Main camera: one recognition is enough, smaller frame, shorter rescan delay.
+          # Main camera: faster image, immediate result, fast repeated scans.
           p=Path('czk-pln/index.html')
           s=p.read_text(encoding='utf-8')
           s=s.replace('const defaults={scanWidth:55,scanHeight:18,contrast:17,confidence:45,stability:2};',
@@ -56,55 +37,48 @@ jobs:
 
           marker="""    if(full){const n=num(full[1]);if(n>.05&&n<100000){const c=candidateScore(n,bi.b,conf,3.2);c.text=full[1];c.kind='decimal';a.push(c)}}
 """
-          addition="""    if(full){const n=num(full[1]);if(n>.05&&n<100000){const c=candidateScore(n,bi.b,conf,3.2);c.text=full[1];c.kind='decimal';a.push(c)}}
-    const dash=t.match(/(?:^|[^0-9])(\\d{1,5})(?:[.,])?-(?:[^0-9]|$)/);
+          addition=marker+"""    const dash=t.match(/(?:^|[^0-9])(\\d{1,5})(?:[.,])?-(?:[^0-9]|$)/);
     if(dash){const n=Number(dash[1]);if(n>.05&&n<100000){const c=candidateScore(n,bi.b,conf,4.0);c.text=dash[0];c.kind='whole-dash';a.push(c)}}
 """
-          if 'c.kind=\'whole-dash\'' not in s:
-              if marker not in s: raise SystemExit('pattern not found: index whole-dash insertion')
-              s=s.replace(marker, addition, 1)
+          if "c.kind='whole-dash'" not in s:
+              if marker not in s: raise SystemExit('index dash marker missing')
+              s=s.replace(marker,addition,1)
 
           old="let w=await getWorker(),r=await w.recognize(canvas,{}, {text:true,blocks:true}),c=chooseCandidate(r.data);"
           new="let w=await getWorker();window.OCR_LIVE_FAST=true;let r=await w.recognize(canvas,{}, {text:true,blocks:true});window.OCR_LIVE_FAST=false;let c=chooseCandidate(r.data);"
-          if old in s: s=s.replace(old,new,1)
-          elif new not in s: raise SystemExit('pattern not found: live fast flag')
-
-          s=s.replace("finally{busy=false;if(running)timer=setTimeout(scan,500)}",
-                      "finally{window.OCR_LIVE_FAST=false;busy=false;if(running)timer=setTimeout(scan,120)}")
-          s=s.replace('timer=setTimeout(scan,250)', 'timer=setTimeout(scan,80)')
+          if old in s:s=s.replace(old,new,1)
+          elif new not in s:raise SystemExit('live fast scan marker missing')
+          s=s.replace('finally{busy=false;if(running)timer=setTimeout(scan,500)}',
+                      'finally{window.OCR_LIVE_FAST=false;busy=false;if(running)timer=setTimeout(scan,120)}')
+          s=s.replace('timer=setTimeout(scan,250)','timer=setTimeout(scan,80)')
           p.write_text(s,encoding='utf-8')
 
-          # 3) Heavy smart fallbacks are skipped for live camera frames.
-          p=Path('czk-pln/ocr-smart.js')
-          s=p.read_text(encoding='utf-8')
-          old="if(!hasDecimalCandidate(result.data)&&image instanceof HTMLCanvasElement){"
-          new="if(!window.OCR_LIVE_FAST&&!hasDecimalCandidate(result.data)&&image instanceof HTMLCanvasElement){"
-          if old in s: s=s.replace(old,new,1)
-          elif new not in s: raise SystemExit('pattern not found: ocr-smart live guard')
+          # Existing expensive fallbacks stay available for static tests, but not every live frame.
+          p=Path('czk-pln/ocr-smart.js');s=p.read_text(encoding='utf-8')
+          old='if(!hasDecimalCandidate(result.data)&&image instanceof HTMLCanvasElement){'
+          new='if(!window.OCR_LIVE_FAST&&!hasDecimalCandidate(result.data)&&image instanceof HTMLCanvasElement){'
+          if old in s:s=s.replace(old,new,1)
+          elif new not in s:raise SystemExit('ocr-smart live guard marker missing')
           p.write_text(s,encoding='utf-8')
 
-          p=Path('czk-pln/ocr-runtime-v2.js')
-          s=p.read_text(encoding='utf-8')
-          old="const image=rargs[0];if(!(image instanceof HTMLCanvasElement)||structuredAlready(result.data))return result;"
-          new="const image=rargs[0];if(window.OCR_LIVE_FAST)return result;if(!(image instanceof HTMLCanvasElement)||structuredAlready(result.data))return result;"
-          if old in s: s=s.replace(old,new,1)
-          elif new not in s: raise SystemExit('pattern not found: runtime live guard')
+          p=Path('czk-pln/ocr-runtime-v2.js');s=p.read_text(encoding='utf-8')
+          old='const image=rargs[0];if(!(image instanceof HTMLCanvasElement)||structuredAlready(result.data))return result;'
+          new='const image=rargs[0];if(window.OCR_LIVE_FAST)return result;if(!(image instanceof HTMLCanvasElement)||structuredAlready(result.data))return result;'
+          if old in s:s=s.replace(old,new,1)
+          elif new not in s:raise SystemExit('runtime live guard marker missing')
           p.write_text(s,encoding='utf-8')
 
-          # 4) Test: recognise common structured prices in the first pass and stop there.
-          p=Path('czk-pln/test-mode.js')
-          s=p.read_text(encoding='utf-8')
-
+          # Test mode: one cheap pass first. Sparse/binary only when the first pass has no structured price.
+          p=Path('czk-pln/test-mode.js');s=p.read_text(encoding='utf-8')
           old="""    for(const m of s.matchAll(/(?:^|[^0-9])(\\d{1,4})\\s*([,.])\\s*-(?!\\d)/g)){const n=Number(m[1]);if(n>.05&&n<100000)out.push({n,kind:'whole-dash',quality:8})}
     return out;
 """
           new="""    for(const m of s.matchAll(/(?:^|[^0-9])(\\d{1,4})\\s*([,.])\\s*-(?!\\d)/g)){const n=Number(m[1]);if(n>.05&&n<100000)out.push({n,kind:'whole-dash',quality:8})}
-    // OCR often drops the dot/comma from Czech whole-price notation and returns just "8-".
     for(const m of s.matchAll(/(?:^|[^0-9])(\\d{1,4})\\s*-(?!\\d)/g)){const n=Number(m[1]);if(n>.05&&n<100000)out.push({n,kind:'whole-dash',quality:7})}
     return out;
 """
-          if old in s: s=s.replace(old,new,1)
-          elif 'OCR often drops the dot/comma' not in s: raise SystemExit('pattern not found: test bare dash')
+          if old in s:s=s.replace(old,new,1)
+          elif "kind:'whole-dash',quality:7" not in s:raise SystemExit('test dash marker missing')
 
           s=s.replace('const outW=Math.min(1200,Math.max(640,Math.round(sw*4)))',
                       'const outW=Math.min(820,Math.max(480,Math.round(sw*2.8)))')
@@ -117,38 +91,28 @@ jobs:
 """
           new="""      passes.push(await onePass(worker,source,'linia','soft',7));if(token!==recognizeToken||!active)return null;
       let chosen=pickMultiPass(passes);
-      if(!chosen?.structured){
-        passes.push(await onePass(worker,source,'sparse','normal',11));if(token!==recognizeToken||!active)return null;
-        chosen=pickMultiPass(passes);
-      }
-      if(!chosen?.structured){
-        passes.push(await onePass(worker,source,'binary','binary',7));if(token!==recognizeToken||!active)return null;
-        chosen=pickMultiPass(passes);
-      }
+      if(!chosen?.structured){passes.push(await onePass(worker,source,'sparse','normal',11));if(token!==recognizeToken||!active)return null;chosen=pickMultiPass(passes)}
+      if(!chosen?.structured){passes.push(await onePass(worker,source,'binary','binary',7));if(token!==recognizeToken||!active)return null;chosen=pickMultiPass(passes)}
       try{await worker.setParameters({tessedit_pageseg_mode:'7',tessedit_char_whitelist:'0123456789,.-'})}catch{}
       const got=chosen?.n??null,known=hasExpected(label),ok=known&&got!==null&&Math.abs(got-Number(label.expected))<.011,result={got,ok,known,kind:chosen?.kind||null,diag:diagnosticPasses(passes)};
 """
-          if old in s: s=s.replace(old,new,1)
-          elif 'let chosen=pickMultiPass(passes);' not in s: raise SystemExit('pattern not found: test fast first')
-
+          if old in s:s=s.replace(old,new,1)
+          elif 'let chosen=pickMultiPass(passes);' not in s:raise SystemExit('test fast-first marker missing')
           s=s.replace('gestureTimer=setTimeout(()=>{if(active&&!auto)recognizeCurrentView()},320)',
                       'gestureTimer=setTimeout(()=>{if(active&&!auto)recognizeCurrentView()},100)')
           p.write_text(s,encoding='utf-8')
           PY
 
-      - name: Commit speed patch
+      - name: Commit changes
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .github/workflows/pages.yml czk-pln/index.html czk-pln/test-mode.js czk-pln/ocr-smart.js czk-pln/ocr-runtime-v2.js
-          if git diff --cached --quiet; then
-            echo "No changes"
-          else
-            git commit -m "Speed up live OCR and use Warsaw version time"
-            git push origin HEAD:master
-          fi
+          git add czk-pln/index.html czk-pln/test-mode.js czk-pln/ocr-smart.js czk-pln/ocr-runtime-v2.js
+          git diff --cached --quiet && exit 0
+          git commit -m "Speed up live price OCR"
+          git push origin HEAD:master
 
       - name: Deploy Pages
         env:
