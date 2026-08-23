@@ -4,6 +4,12 @@
   const runtimePatch=document.createElement('script');
   runtimePatch.src=`./ocr-runtime-v2.js?v=${encodeURIComponent(window.APP_VERSION||'dev')}`;
   runtimePatch.async=false;
+  runtimePatch.onload=()=>{
+    const compat=document.createElement('script');
+    compat.src=`./ocr-runtime-compat.js?v=${encodeURIComponent(window.APP_VERSION||'dev')}`;
+    compat.async=false;
+    document.head.appendChild(compat);
+  };
   document.head.appendChild(runtimePatch);
 
   const installedVersion = window.APP_VERSION || 'nieznana';
