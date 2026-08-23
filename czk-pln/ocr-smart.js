@@ -6,6 +6,7 @@
   const median=a=>{const b=[...a].sort((x,y)=>x-y);return b.length?b[Math.floor(b.length/2)]:0};
   const digits=s=>String(s||'').replace(/[^0-9]/g,'');
   const h=b=>Math.max(1,b.y1-b.y0), w=b=>Math.max(1,b.x1-b.x0);
+  const normDash=s=>String(s||'').replace(/[–—−]/g,'-');
 
   function allWords(data){
     const out=[],seen=new Set();
@@ -61,8 +62,28 @@
     data.smartSplits=(data.smartSplits||[]).concat(synthetic.map(s=>({text:s.text,source:s._source,heightRatio:s._heightRatio??null,rightRaw:s._rightRaw??null})));
   }
 
+  function wholeDashCandidates(data){
+    const out=[],words=allWords(data);
+    for(const word of words){
+      const t=normDash(word.text);
+      const m=t.match(/(?:^|[^0-9])(\d{1,5})\s*[,\.]\s*-(?:$|[^0-9])/);
+      if(m){const s=makeSynthetic(Number(m[1]),0,word.bbox,Number(word.confidence??80)+12,{_source:'whole-dash'});if(s)out.push(s)}
+    }
+    // Tesseract potrafi rozdzielić "8.-" na kilka słów. Wtedy korzystamy z tekstu całej linii
+    // i bbox największej liczby całkowitej, ale tylko gdy w surowym OCR faktycznie jest kropka/przecinek + kreska.
+    const raw=normDash(data?.text||'');
+    const m=raw.match(/(?:^|[^0-9])(\d{1,5})\s*[,\.]\s*-(?:$|[^0-9])/);
+    if(m){
+      const n=Number(m[1]);
+      const main=words.filter(x=>digits(x.text)===String(n)&&x.bbox).sort((a,b)=>(w(b.bbox)*h(b.bbox))-(w(a.bbox)*h(a.bbox)))[0];
+      if(main){const s=makeSynthetic(n,0,main.bbox,Number(main.confidence??75)+10,{_source:'whole-dash-line'});if(s)out.push(s)}
+    }
+    return out;
+  }
+
   function enhanceGeometry(data){
     if(!data)return;const words=allWords(data),synthetic=[];
+    synthetic.push(...wholeDashCandidates(data));
     for(const x of words){if(!/\d[.,]\d{2}/.test(String(x.text||''))){const c=mergedSplitCandidate(x);if(c)synthetic.push(c)}}
     synthetic.push(...separateSplitCandidates(words));addSynthetic(data,synthetic);
   }
@@ -75,7 +96,6 @@
   function makeRightCrop(image,mainBox,binary=false){
     if(!(image instanceof HTMLCanvasElement))return null;
     const H=image.height,W=image.width,mh=h(mainBox),mw=w(mainBox);
-    // Ważne: nie bierzemy ani kawałka dużej liczby. Pierwszy OCR już ją zna.
     const sx=Math.max(0,Math.min(W-1,Math.floor(mainBox.x1+Math.max(2,mh*0.03))));
     const sy=Math.max(0,Math.floor(mainBox.y0-mh*1.05));
     const ex=Math.min(W,Math.ceil(mainBox.x1+Math.max(mh*4.0,mw*2.4)));
@@ -84,56 +104,42 @@
 
     const c=document.createElement('canvas');c.width=Math.min(1600,Math.max(500,Math.round(sw*5)));c.height=Math.max(220,Math.round(sh*c.width/sw));
     const cx=c.getContext('2d',{willReadFrequently:true});cx.imageSmoothingEnabled=true;cx.drawImage(image,sx,sy,sw,sh,0,0,c.width,c.height);
-    if(binary){
-      const im=cx.getImageData(0,0,c.width,c.height),d=im.data;
-      for(let i=0;i<d.length;i+=4){const y=.299*d[i]+.587*d[i+1]+.114*d[i+2],v=y<190?0:255;d[i]=d[i+1]=d[i+2]=v}
-      cx.putImageData(im,0,0);
-    }
+    if(binary){const im=cx.getImageData(0,0,c.width,c.height),d=im.data;for(let i=0;i<d.length;i+=4){const y=.299*d[i]+.587*d[i+1]+.114*d[i+2],v=y<190?0:255;d[i]=d[i+1]=d[i+2]=v}cx.putImageData(im,0,0)}
     return {canvas:c,sx,sy,sw,sh,binary};
   }
 
   function centsFromData(data,mainValue){
     const cand=[];
-    for(const x of allWords(data)){
-      const t=digits(x.text),conf=Number(x.confidence??0);
-      if(/^\d{2}$/.test(t))cand.push({cents:Number(t),confidence:conf,text:t});
-      else if(/^\d{3,7}$/.test(t)&&t!==String(mainValue))cand.push({cents:Number(t.slice(-2)),confidence:conf-10,text:t});
-    }
-    const raw=digits(data?.text||'');
-    if(/^\d{2}$/.test(raw))cand.push({cents:Number(raw),confidence:60,text:raw});
-    else if(/^\d{3,7}$/.test(raw)&&raw!==String(mainValue))cand.push({cents:Number(raw.slice(-2)),confidence:45,text:raw});
+    for(const x of allWords(data)){const t=digits(x.text),conf=Number(x.confidence??0);if(/^\d{2}$/.test(t))cand.push({cents:Number(t),confidence:conf,text:t});else if(/^\d{3,7}$/.test(t)&&t!==String(mainValue))cand.push({cents:Number(t.slice(-2)),confidence:conf-10,text:t})}
+    const raw=digits(data?.text||'');if(/^\d{2}$/.test(raw))cand.push({cents:Number(raw),confidence:60,text:raw});else if(/^\d{3,7}$/.test(raw)&&raw!==String(mainValue))cand.push({cents:Number(raw.slice(-2)),confidence:45,text:raw});
     return cand.filter(x=>x.cents>=0&&x.cents<=99).sort((a,b)=>b.confidence-a.confidence)[0]||null;
   }
 
   async function readRightSuffix(worker,originalRecognize,image,main,resultData){
-    const attempts=[];
-    const configs=[
-      {psm:'8',binary:true,label:'word-binary'},
-      {psm:'11',binary:false,label:'sparse-gray'},
-      {psm:'7',binary:false,label:'line-gray'}
-    ];
+    const attempts=[],configs=[{psm:'8',binary:true,label:'word-binary'},{psm:'11',binary:false,label:'sparse-gray'},{psm:'7',binary:false,label:'line-gray'}];
     try{
       for(const cfg of configs){
         const crop=makeRightCrop(image,main.word.bbox,cfg.binary);if(!crop)continue;
         await worker.setParameters({tessedit_char_whitelist:'0123456789',tessedit_pageseg_mode:cfg.psm,preserve_interword_spaces:'1'});
         const rr=await originalRecognize(crop.canvas,{}, {text:true,blocks:true});
-        const raw=String(rr?.data?.text||'').trim().replace(/\s+/g,' '),suffix=centsFromData(rr?.data,main.n);
-        attempts.push({mode:cfg.label,raw,found:suffix?.cents??null});
-        if(suffix){
-          resultData.smartRightPass={main:main.n,attempts};
-          return {suffix,crop,raw};
-        }
+        const raw=String(rr?.data?.text||'').trim().replace(/\s+/g,' '),suffix=centsFromData(rr?.data,main.n);attempts.push({mode:cfg.label,raw,found:suffix?.cents??null});
+        if(suffix){resultData.smartRightPass={main:main.n,attempts};return {suffix,crop,raw}}
       }
-      resultData.smartRightPass={main:main.n,attempts};
-      return null;
+      resultData.smartRightPass={main:main.n,attempts};return null;
     } finally {
-      // Przywracamy ustawienia używane przez normalny skaner.
-      await worker.setParameters({tessedit_char_whitelist:'0123456789,.',tessedit_pageseg_mode:'7',preserve_interword_spaces:'1'}).catch(()=>{});
+      await worker.setParameters({tessedit_char_whitelist:'0123456789,.-',tessedit_pageseg_mode:'7',preserve_interword_spaces:'1'}).catch(()=>{});
     }
   }
 
   Tesseract.createWorker=async(...args)=>{
-    const worker=await originalCreate(...args),originalRecognize=worker.recognize.bind(worker);
+    const worker=await originalCreate(...args),originalRecognize=worker.recognize.bind(worker),originalSetParameters=worker.setParameters.bind(worker);
+    // Główny skaner wcześniej zabraniał znaku '-', więc Tesseract fizycznie nie mógł zwrócić "8.-".
+    // Rozszerzamy tylko whitelisty cenowe (z kropką/przecinkiem), pozostawiając cyfrowe fallbacki bez zmian.
+    worker.setParameters=async params=>{
+      const p={...(params||{})};
+      if(typeof p.tessedit_char_whitelist==='string'&&(p.tessedit_char_whitelist.includes(',')||p.tessedit_char_whitelist.includes('.'))&&!p.tessedit_char_whitelist.includes('-'))p.tessedit_char_whitelist+='-';
+      return originalSetParameters(p);
+    };
     worker.recognize=async(...rargs)=>{
       const result=await originalRecognize(...rargs);if(!result?.data)return result;
       enhanceGeometry(result.data);
@@ -145,8 +151,7 @@
             const right=await readRightSuffix(worker,originalRecognize,image,main,result.data);
             if(right){
               const bbox={x0:main.word.bbox.x0,y0:Math.min(main.word.bbox.y0,right.crop.sy),x1:Math.min(image.width,right.crop.sx+right.crop.sw),y1:Math.max(main.word.bbox.y1,Math.min(image.height,right.crop.sy+right.crop.sh))};
-              const synthetic=makeSynthetic(main.n,right.suffix.cents,bbox,Math.min(98,Math.max(main.confidence,right.suffix.confidence)+8),{_source:'second-pass-right',_rightRaw:right.raw});
-              if(synthetic)addSynthetic(result.data,[synthetic]);
+              const synthetic=makeSynthetic(main.n,right.suffix.cents,bbox,Math.min(98,Math.max(main.confidence,right.suffix.confidence)+8),{_source:'second-pass-right',_rightRaw:right.raw});if(synthetic)addSynthetic(result.data,[synthetic]);
             }
           }catch(e){result.data.smartRightPass={main:main.n,error:String(e?.message||e)};console.debug('OCR right-suffix fallback failed',e)}
         }
