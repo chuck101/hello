@@ -12,6 +12,11 @@
   };
   document.head.appendChild(runtimePatch);
 
+  const uiFixes=document.createElement('script');
+  uiFixes.src=`./ui-fixes.js?v=${encodeURIComponent(window.APP_VERSION||'dev')}`;
+  uiFixes.async=false;
+  document.head.appendChild(uiFixes);
+
   const installedVersion = window.APP_VERSION || 'nieznana';
   const versionEl = document.getElementById('appVersion');
   const statusEl = document.getElementById('updateStatus');
