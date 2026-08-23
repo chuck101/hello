@@ -56,6 +56,35 @@
     if(label)label.textContent='1.4×';
   }
 
+  const RESET_KEY='manual_reset_seconds';
+  const DEFAULT_RESET_SECONDS=2;
+  const resetSeconds=()=>{
+    const n=Number(localStorage.getItem(RESET_KEY));
+    return Number.isFinite(n)&&n>=1&&n<=10?n:DEFAULT_RESET_SECONDS;
+  };
+
+  // Add the manual-calculator timeout to Settings without changing the base page markup.
+  const settingsForm=document.getElementById('settingsForm');
+  if(settingsForm&&!document.getElementById('manualResetSeconds')){
+    const courseHeading=[...settingsForm.querySelectorAll('h3')].find(h=>h.textContent.includes('Kurs CZK'));
+    const wrap=document.createElement('div');
+    wrap.innerHTML=`
+      <h3>Kalkulator ręczny</h3>
+      <label for="manualResetSeconds">Czas do rozpoczęcia nowej ceny</label>
+      <div class="rangeRow"><input id="manualResetSeconds" type="range" min="1" max="10" step="1"><span id="manualResetSecondsVal" class="rangeVal"></span></div>
+      <p class="settingNote">Po tym czasie następna cyfra automatycznie rozpocznie nową cenę.</p>`;
+    while(wrap.firstChild)settingsForm.insertBefore(wrap.firstChild,courseHeading||null);
+    const slider=document.getElementById('manualResetSeconds');
+    const value=document.getElementById('manualResetSecondsVal');
+    const sync=()=>{const n=resetSeconds();slider.value=String(n);value.textContent=`${n} s`};
+    sync();
+    slider.addEventListener('input',()=>{
+      const n=Math.max(1,Math.min(10,Number(slider.value)||DEFAULT_RESET_SECONDS));
+      localStorage.setItem(RESET_KEY,String(n));
+      value.textContent=`${n} s`;
+    });
+  }
+
   const dlg=document.getElementById('manualDlg');
   const openBtn=document.getElementById('manual');
   if(!dlg||!openBtn)return;
@@ -89,7 +118,6 @@
   const idle=document.getElementById('manualIdle');
   const idleText=document.getElementById('manualIdleText');
   const idleBar=document.getElementById('manualIdleBar');
-  const TIMEOUT=3000;
   let buffer='',replaceOnNext=false,lastInputAt=0,idleTimer=0;
 
   const fmt=n=>new Intl.NumberFormat('pl-PL',{minimumFractionDigits:2,maximumFractionDigits:2}).format(n);
@@ -103,10 +131,11 @@
 
   function armIdle(){
     clearInterval(idleTimer);replaceOnNext=false;lastInputAt=performance.now();idle.classList.remove('ready');
+    const timeout=resetSeconds()*1000;
     const tick=()=>{
       const elapsed=performance.now()-lastInputAt;
-      const left=Math.max(0,TIMEOUT-elapsed);
-      const pct=Math.max(0,Math.min(100,left/TIMEOUT*100));
+      const left=Math.max(0,timeout-elapsed);
+      const pct=Math.max(0,Math.min(100,left/timeout*100));
       idleBar.style.width=pct+'%';
       if(left<=0){
         replaceOnNext=true;idle.classList.add('ready');idleText.textContent='Następna cyfra zacznie nową cenę';idleBar.style.width='0%';clearInterval(idleTimer);idleTimer=0;
